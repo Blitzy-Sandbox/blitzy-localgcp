@@ -225,6 +225,10 @@ This section cross-maps the four AAP-specified extensions to Blitzy's quality an
 
 **Fixes applied during autonomous validation**: 17 QA documentation findings resolved via commit `5dffb8d`; 8 Checkpoint-2 review findings resolved via `c28b5b5`; Checkpoint-1 review findings (5 MAJOR + 6 MINOR) resolved via `aa5e860`; Cloud Run Docker `args`/`env` forwarding corrected in `c242750`; Logging GCS sink Unix-epoch timestamp guard added in `bc6517d`.
 
+### 5.1 Segmented PR Review
+
+Because this change set qualifies as a large-scale PR under the *Segmented PR Review* rule (AAP §0.8.4), a dedicated six-phase code review has been produced and committed as [CODE_REVIEW.md](../../CODE_REVIEW.md) at the repository root. The six phases — **Discovery**, **Architecture**, **API Contract**, **Scope Enforcement**, **Test Coverage**, and **Build & Gate Verification** — each carry explicit PASS/FAIL criteria with byte-level evidence (`grep`, file paths, exact error strings). All six phases PASS with no deferred findings. The review is the authoritative audit trail for every AAP Rule (1–9) and every Validation Gate (1, 2, 8, 9, 10, 12, 13) touched by this PR.
+
 ---
 
 ## 6. Risk Assessment

@@ -392,6 +392,15 @@ Yes — MIT licensed. No paid tier, no telemetry, no cloud lock-in.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
+For large-scale PRs (such as the current Extensions A–D change set — Cloud Run actual execution, GCS → Pub/Sub notifications, Cloud Scheduler as the 10th native service on port 8094, and Cloud Logging sinks), the project uses a *Segmented PR Review* workflow. The most recent six-phase review — covering discovery, architecture, API contracts, scope, test coverage, and build/gate verification — is documented in [CODE_REVIEW.md](CODE_REVIEW.md) at the repository root. New large-scale PRs are expected to produce (or update) this document before merge.
+
+Additional project documentation:
+
+- [CODE_REVIEW.md](CODE_REVIEW.md) — current segmented PR review (six phases, rule-by-rule verification).
+- [blitzy/documentation/Project Guide.md](blitzy/documentation/Project%20Guide.md) — completion status and remaining human tasks.
+- [blitzy/documentation/Technical Specifications.md](blitzy/documentation/Technical%20Specifications.md) — full technical specification for the emulator.
+- [ROADMAP.md](ROADMAP.md) — shipped and upcoming work.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
