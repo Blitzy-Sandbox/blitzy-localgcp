@@ -132,7 +132,20 @@ func (s *Service) Name() string { return "Cloud Run" }
 // RPCs. The serve context is stashed on the Service so per-service
 // proxy listeners spawned by CreateService inherit cancellation from
 // the parent.
+//
+// Lazy runtime auto-initialization: when --no-docker is NOT in effect
+// and no runtime was injected via SetRuntime, a fresh DockerRuntime
+// is constructed here. This ensures that instantiating cloudrun.New
+// stand-alone (e.g., in unit tests or non-standard wiring paths)
+// still yields a functional service without the caller having to
+// remember to call SetRuntime. Rule 4 is preserved: when noDocker is
+// true no runtime is created and all container operations are
+// unconditionally skipped downstream.
 func (s *Service) Start(ctx context.Context, addr string) error {
+	if !s.noDocker && s.runtime == nil {
+		s.runtime = orchestrator.NewDockerRuntime(s.logger)
+	}
+
 	s.serveCtx = ctx
 
 	srv := grpc.NewServer(
@@ -241,7 +254,10 @@ func (s *Service) CreateService(ctx context.Context, req *runpb.CreateServiceReq
 	// Build and start the per-service reverse proxy. In --no-docker
 	// mode proxyRuntime() returns nil, which causes the proxy to
 	// serve 503 on every request without ever touching Docker.
-	proxy := newServiceProxy(name, image, internalPort, hostPort, s.proxyRuntime(), s.logger, s.quiet)
+	// The store is threaded through so boot() can persist the Docker
+	// container ID into ContainerRef.ContainerID once the container
+	// is successfully started (closes the orphan-container window).
+	proxy := newServiceProxy(name, image, internalPort, hostPort, s.proxyRuntime(), s.store, s.logger, s.quiet)
 	proxyCtx := s.serveCtx
 	if proxyCtx == nil {
 		proxyCtx = context.Background()

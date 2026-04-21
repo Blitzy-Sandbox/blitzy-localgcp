@@ -128,6 +128,27 @@ func (s *Store) GetRef(name string) (*ContainerRef, bool) {
 	return r, ok
 }
 
+// SetContainerID updates ONLY the ContainerID field of the existing
+// ContainerRef for the named service. This is the persistence hook
+// invoked by serviceProxy.boot() once a Docker container has been
+// successfully created and started, so that subsequent DeleteService
+// calls (or future --data-dir restore paths) can correctly locate the
+// container for Stop + Remove.
+//
+// Returns an error when no ContainerRef exists for the given service
+// name — callers should have invoked SetRef at CreateService time.
+// The update is performed atomically under the existing write lock.
+func (s *Store) SetContainerID(name, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ref, ok := s.refs[name]
+	if !ok {
+		return fmt.Errorf("cloudrun: no container ref for service %q", name)
+	}
+	ref.ContainerID = id
+	return nil
+}
+
 // Create inserts a new service into the store. If a service with the
 // same name already exists, an error is returned. The service's URI
 // is populated by the caller via SetURI after CreateService allocates

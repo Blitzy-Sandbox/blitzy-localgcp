@@ -141,20 +141,19 @@ func TestCreateJob_NoTarget_ReturnsInvalidArgument(t *testing.T) {
 	}
 }
 
-// TestCreateJob_AppEngineTargetPassesValidation exercises the branch of
-// validateJob that counts GetAppEngineHttpTarget() as a valid single target.
-// AppEngine targets are out-of-scope at the dispatch layer (AAP §0.6.2) —
-// dispatchOnce logs "AppEngine targets not supported" — but validation
-// itself accepts them so that CreateJob semantics remain backward compatible
-// with real Cloud Scheduler payloads.
+// TestCreateJob_AppEngineTarget_ReturnsInvalidArgument verifies that
+// AppEngineHttpTarget is rejected at validateJob time with
+// codes.InvalidArgument. AppEngine HTTP targets are explicitly out of
+// scope (AAP §0.6.2); the emulator refuses them outright rather than
+// silently accepting the request and never dispatching (which would
+// produce confusing per-tick "no recognised target" log spam).
 //
-// Note: protobuf oneof semantics make it impossible to construct a Job with
-// two targets simultaneously via the public Go API (the last assignment
-// always wins). Hence we cannot directly exercise the >1 branch of
-// validateJob through the public surface. The "multiple targets" branch in
-// validateJob is therefore a defence-in-depth guard for reflection-based
-// proto construction.
-func TestCreateJob_AppEngineTargetPassesValidation(t *testing.T) {
+// Note: protobuf oneof semantics make it impossible to construct a Job
+// with two targets simultaneously via the public Go API (the last
+// assignment always wins), so the ">1 target" branch of validateJob
+// cannot be exercised through the public surface — that branch is a
+// defence-in-depth guard for reflection-based proto construction.
+func TestCreateJob_AppEngineTarget_ReturnsInvalidArgument(t *testing.T) {
 	svc := newTestService(t)
 	req := &schedulerpb.CreateJobRequest{
 		Parent: testParent,
@@ -166,8 +165,9 @@ func TestCreateJob_AppEngineTargetPassesValidation(t *testing.T) {
 			},
 		},
 	}
-	if _, err := svc.CreateJob(context.Background(), req); err != nil {
-		t.Fatalf("CreateJob with AppEngine target: %v", err)
+	_, err := svc.CreateJob(context.Background(), req)
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Errorf("code = %v, want InvalidArgument; err=%v", got, err)
 	}
 }
 

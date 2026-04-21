@@ -385,8 +385,9 @@ func (s *Service) unscheduleJob(name string) {
 }
 
 // dispatchOnce performs a single delivery attempt for the job's target. All
-// errors are logged to stderr and never returned — the caller's goroutine is
-// transient (Rule 3).
+// errors are logged via s.logger (stderr-prefixed with "[cloudscheduler]"
+// and gated by the quiet flag) and never returned — the caller's goroutine
+// is transient (Rule 3).
 func (s *Service) dispatchOnce(job *Job) {
 	switch {
 	case job.HTTPTarget != nil:
@@ -395,8 +396,11 @@ func (s *Service) dispatchOnce(job *Job) {
 		s.dispatchPubsub(job, job.PubsubTarget)
 	default:
 		// AppEngineHttpTarget is explicitly out of scope (AAP §0.6.2) and
-		// is not preserved on the internal Job; jobs created with that
-		// target land here with no recognised target.
+		// is now rejected at validateJob time, so a job reaching this
+		// branch indicates a store-level inconsistency (e.g., an unknown
+		// oneof variant was mutated in-place). Logging at the service
+		// logger keeps the observation uniform with the other dispatch
+		// paths.
 		s.logger.Printf("job %s has no recognised target", job.Name)
 	}
 }
@@ -414,7 +418,7 @@ func (s *Service) dispatchHTTP(job *Job, t *schedulerpb.HttpTarget) {
 	}
 	res := s.dispatcher.Dispatch(context.Background(), t.GetUri(), t.GetBody(), headers)
 	if res.Err != nil {
-		fmt.Fprintf(os.Stderr, "[cloudscheduler] http dispatch %s: %v (attempts=%d status=%d)\n",
+		s.logger.Printf("http dispatch %s: %v (attempts=%d status=%d)",
 			job.Name, res.Err, res.Attempts, res.StatusCode)
 	}
 }
@@ -429,29 +433,35 @@ func (s *Service) dispatchPubsub(job *Job, t *schedulerpb.PubsubTarget) {
 		return
 	}
 	if err := publishToPubsub(s.pubsubAddr, t.GetTopicName(), t.GetData(), t.GetAttributes()); err != nil {
-		fmt.Fprintf(os.Stderr, "[cloudscheduler] pubsub dispatch %s: %v\n", job.Name, err)
+		s.logger.Printf("pubsub dispatch %s: %v", job.Name, err)
 	}
 }
 
 // --- Validation & helpers ---
 
-// validateJob enforces basic structural requirements: schedule must parse and
-// exactly one target must be set (AppEngineHttpTarget is accepted as a
-// best-effort passthrough — it will simply not dispatch anything).
+// validateJob enforces basic structural requirements:
+//
+//   - schedule (if set) must parse as a 5-field standard cron expression,
+//   - exactly one of HttpTarget or PubsubTarget must be set,
+//   - AppEngineHttpTarget is explicitly rejected — AAP §0.6.2 lists App
+//     Engine targets as out of scope, so jobs carrying one are refused at
+//     create/update time with codes.InvalidArgument rather than silently
+//     accepted and then never dispatched (which would surface as
+//     per-tick "no recognised target" log spam and confuse SDK users).
 func validateJob(job *schedulerpb.Job) error {
 	if job.GetSchedule() != "" {
 		if _, err := cron.ParseStandard(job.GetSchedule()); err != nil {
 			return status.Errorf(codes.InvalidArgument, "invalid schedule %q: %v", job.GetSchedule(), err)
 		}
 	}
+	if job.GetAppEngineHttpTarget() != nil {
+		return status.Error(codes.InvalidArgument, "localgcp: AppEngineHttpTarget is not supported")
+	}
 	targetCount := 0
 	if job.GetHttpTarget() != nil {
 		targetCount++
 	}
 	if job.GetPubsubTarget() != nil {
-		targetCount++
-	}
-	if job.GetAppEngineHttpTarget() != nil {
 		targetCount++
 	}
 	if targetCount == 0 {
@@ -497,11 +507,11 @@ var Now = time.Now
 // suitable for storage. Called at RPC entry points (CreateJob, UpdateJob)
 // where the request carries a proto representation.
 //
-// Note: AppEngineHttpTarget is explicitly out of scope (AAP §0.6.2) and the
-// internal Job struct has no field for it; jobs created with an AppEngine
-// target pass validation but their target payload is discarded on
-// conversion. This matches the dispatch-time behaviour where such targets
-// would have produced a "not supported" log entry anyway.
+// Note: AppEngineHttpTarget is explicitly out of scope (AAP §0.6.2) and
+// rejected at validateJob time with codes.InvalidArgument, so any job
+// reaching jobFromProto is guaranteed not to carry one. The internal Job
+// struct deliberately has no AppEngine field; no silent-discard path
+// exists.
 func jobFromProto(p *schedulerpb.Job) *Job {
 	if p == nil {
 		return nil

@@ -73,6 +73,7 @@ type serviceProxy struct {
 	internalPort string                        // internal container port, e.g. "8080/tcp"
 	hostPort     int                           // reverse-proxy listener port, from the pool
 	runtime      orchestrator.ContainerRuntime // nil in --no-docker stub mode
+	store        *Store                        // persistence hook for ContainerID on successful boot
 	logger       *log.Logger
 	quiet        bool
 
@@ -92,7 +93,15 @@ type serviceProxy struct {
 // listener port — this keeps the CreateService URI contract intact
 // (non-empty URI pointing at a real listener) — but every request on
 // that listener is answered with 503 Service Unavailable.
-func newServiceProxy(name, image, internalPort string, hostPort int, runtime orchestrator.ContainerRuntime, logger *log.Logger, quiet bool) *serviceProxy {
+//
+// The store is threaded through so boot() can persist the Docker
+// container ID on the service's ContainerRef once the container has
+// been started. This closes the orphan window where a container could
+// be running but unknown to the store (and therefore unreachable via
+// DeleteService's Stop + Remove calls). store may be nil in non-
+// standard wiring paths; when nil, the SetContainerID persistence
+// step is silently skipped.
+func newServiceProxy(name, image, internalPort string, hostPort int, runtime orchestrator.ContainerRuntime, store *Store, logger *log.Logger, quiet bool) *serviceProxy {
 	if internalPort == "" {
 		internalPort = "8080/tcp"
 	}
@@ -105,6 +114,7 @@ func newServiceProxy(name, image, internalPort string, hostPort int, runtime orc
 		internalPort: internalPort,
 		hostPort:     hostPort,
 		runtime:      runtime,
+		store:        store,
 		logger:       logger,
 		quiet:        quiet,
 	}
@@ -118,8 +128,15 @@ func newServiceProxy(name, image, internalPort string, hostPort int, runtime orc
 // srv.Shutdown(). The container itself is NOT stopped on ctx cancel —
 // use Stop() for full teardown (ensures StopContainer + RemoveContainer
 // are invoked).
+//
+// The listener binds `localhost:{hostPort}` (rather than a hard-coded
+// `127.0.0.1:{hostPort}`) so the resolver picks the correct stack on
+// dual-stack hosts — matching the URI returned by CreateService,
+// which is always `http://localhost:{hostPort}`. On hosts where
+// localhost resolves to ::1 first, binding 127.0.0.1 would cause
+// connection refused errors in SDK clients.
 func (p *serviceProxy) Start(ctx context.Context) error {
-	addr := fmt.Sprintf("127.0.0.1:%d", p.hostPort)
+	addr := fmt.Sprintf("localhost:%d", p.hostPort)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("cloud run proxy listen %s: %w", addr, err)
@@ -230,10 +247,16 @@ func (p *serviceProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			http.StatusBadGateway)
 		return
 	}
+	// Defensive: if boot reported no error but never installed a
+	// reverse proxy, the service has no reachable backend configured.
+	// 503 (Service Unavailable) is the correct semantic code for
+	// "this service has no reachable backend" — as distinct from 502
+	// (Bad Gateway) which means "the upstream returned a bad
+	// response" and implies an upstream was actually contacted.
 	if p.rp == nil {
 		http.Error(w,
-			"localgcp: cloud run container not reachable",
-			http.StatusBadGateway)
+			"localgcp: cloud run proxy backend unavailable",
+			http.StatusServiceUnavailable)
 		return
 	}
 	p.rp.ServeHTTP(w, r)
@@ -276,6 +299,24 @@ func (p *serviceProxy) boot(ctx context.Context) error {
 		return fmt.Errorf("start container %s: %w", p.containerID, err)
 	}
 
+	// Persist the container ID into the store's ContainerRef for this
+	// service BEFORE resolving the host port. This closes the orphan-
+	// container window: if the process is torn down between here and
+	// the end of boot(), DeleteService (or any future --data-dir
+	// restore path) can still locate the container for Stop + Remove.
+	//
+	// A nil store indicates non-standard wiring (e.g., unit tests that
+	// construct serviceProxy directly); the persistence step is
+	// silently skipped in that case. A non-nil store that reports
+	// "ref not found" is logged but not fatal — the container itself
+	// started successfully, and falling back to an in-struct only
+	// record preserves the happy-path behaviour.
+	if p.store != nil {
+		if err := p.store.SetContainerID(p.name, p.containerID); err != nil && !p.quiet {
+			p.logger.Printf("cloud run proxy %s: persist container ID %s: %v", p.name, shortID(p.containerID), err)
+		}
+	}
+
 	// Resolve the Docker-assigned host port for the container's
 	// InternalPort. DockerRuntime.HostPort returns a "127.0.0.1:49152"
 	// style address.
@@ -291,7 +332,14 @@ func (p *serviceProxy) boot(ctx context.Context) error {
 
 	rp := httputil.NewSingleHostReverseProxy(target)
 	rp.Transport = &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		// Proxy is explicitly nil rather than http.ProxyFromEnvironment
+		// because this transport targets a localhost loopback address
+		// (the Docker-assigned host port). Honouring HTTP_PROXY or
+		// HTTPS_PROXY here would misroute requests intended for the
+		// ephemeral container through a corporate outer proxy that has
+		// no knowledge of it, producing confusing connection failures
+		// in environments where those variables are set by default.
+		Proxy:                 nil,
 		MaxIdleConns:          10,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
