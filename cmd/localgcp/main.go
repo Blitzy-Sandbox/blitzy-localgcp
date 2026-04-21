@@ -112,6 +112,7 @@ func upCmd() *cobra.Command {
 	cmd.Flags().IntVar(&cfg.PortKMS, "port-kms", cfg.PortKMS, "Port for Cloud KMS")
 	cmd.Flags().IntVar(&cfg.PortLogging, "port-logging", cfg.PortLogging, "Port for Cloud Logging")
 	cmd.Flags().IntVar(&cfg.PortCloudRun, "port-cloudrun", cfg.PortCloudRun, "Port for Cloud Run")
+	cmd.Flags().IntVar(&cfg.PortCloudScheduler, "port-cloud-scheduler", cfg.PortCloudScheduler, "Port for Cloud Scheduler")
 	cmd.Flags().StringVar(&cfg.OllamaHost, "ollama-host", cfg.OllamaHost, "Ollama API host for Vertex AI backend")
 	cmd.Flags().StringVar(&cfg.VertexModelMap, "vertex-model-map", "", "Model alias mapping (e.g. gemini-2.5-flash=llama3.2)")
 	cmd.Flags().StringVar(&cfg.VertexBackend, "vertex-backend", "", "Vertex AI backend: ollama (default), openai, anthropic, stub")
@@ -129,7 +130,7 @@ func upCmd() *cobra.Command {
 }
 
 func envCmd() *cobra.Command {
-	var portGCS, portPubSub, portFirestore, portSecretManager, portCloudTasks, portVertexAI, portKMS, portLogging, portCloudRun, portBigQuery int
+	var portGCS, portPubSub, portFirestore, portSecretManager, portCloudTasks, portVertexAI, portKMS, portLogging, portCloudRun, portCloudScheduler, portBigQuery int
 
 	cmd := &cobra.Command{
 		Use:   "env",
@@ -138,6 +139,7 @@ func envCmd() *cobra.Command {
 			fmt.Printf("export STORAGE_EMULATOR_HOST=localhost:%d\n", portGCS)
 			fmt.Printf("export PUBSUB_EMULATOR_HOST=localhost:%d\n", portPubSub)
 			fmt.Printf("export FIRESTORE_EMULATOR_HOST=localhost:%d\n", portFirestore)
+			fmt.Printf("export CLOUD_SCHEDULER_EMULATOR_HOST=localhost:%d\n", portCloudScheduler)
 
 			// Check if existing GOOGLE_APPLICATION_CREDENTIALS is set.
 			if existing := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); existing != "" {
@@ -213,6 +215,7 @@ func envCmd() *cobra.Command {
 	cmd.Flags().IntVar(&portKMS, "port-kms", cfg.PortKMS, "Port for Cloud KMS")
 	cmd.Flags().IntVar(&portLogging, "port-logging", cfg.PortLogging, "Port for Cloud Logging")
 	cmd.Flags().IntVar(&portCloudRun, "port-cloudrun", cfg.PortCloudRun, "Port for Cloud Run")
+	cmd.Flags().IntVar(&portCloudScheduler, "port-cloud-scheduler", cfg.PortCloudScheduler, "Port for Cloud Scheduler")
 	cmd.Flags().IntVar(&portBigQuery, "port-bigquery", cfg.PortBigQuery, "Port for BigQuery (LocalBQ)")
 
 	return cmd

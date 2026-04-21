@@ -14,48 +14,50 @@ import (
 
 // Config holds the configuration for the localgcp server.
 type Config struct {
-	PortGCS           int
-	PortPubSub        int
-	PortSecretManager int
-	PortFirestore     int
-	PortCloudTasks    int
-	PortVertexAI      int
-	PortKMS           int
-	PortLogging       int
-	PortCloudRun      int
-	DataDir           string
-	Quiet             bool
-	OllamaHost        string
-	VertexModelMap    string
-	VertexBackend     string // "ollama" (default), "openai", "anthropic", "stub"
-	VertexAPIKey      string // API key for OpenAI/Anthropic backends
-	Services          string // comma-separated orchestrated services (e.g. "spanner,bigtable")
-	NoDocker          bool   // skip all orchestrated services
-	PortSpanner       int
-	PortBigtable      int
-	PortCloudSQL      int
-	PortMemorystore   int
-	PortBigQuery      int
+	PortGCS            int
+	PortPubSub         int
+	PortSecretManager  int
+	PortFirestore      int
+	PortCloudTasks     int
+	PortVertexAI       int
+	PortKMS            int
+	PortLogging        int
+	PortCloudRun       int
+	PortCloudScheduler int
+	DataDir            string
+	Quiet              bool
+	OllamaHost         string
+	VertexModelMap     string
+	VertexBackend      string // "ollama" (default), "openai", "anthropic", "stub"
+	VertexAPIKey       string // API key for OpenAI/Anthropic backends
+	Services           string // comma-separated orchestrated services (e.g. "spanner,bigtable")
+	NoDocker           bool   // skip all orchestrated services
+	PortSpanner        int
+	PortBigtable       int
+	PortCloudSQL       int
+	PortMemorystore    int
+	PortBigQuery       int
 }
 
 // DefaultConfig returns the default server configuration.
 func DefaultConfig() Config {
 	return Config{
-		PortGCS:           4443,
-		PortPubSub:        8085,
-		PortSecretManager: 8086,
-		PortFirestore:     8088,
-		PortCloudTasks:    8089,
-		PortVertexAI:      8090,
-		PortKMS:           8091,
-		PortLogging:       8092,
-		PortCloudRun:      8093,
-		PortSpanner:       9010,
-		PortBigtable:      9094,
-		PortCloudSQL:      5432,
-		PortMemorystore:   6379,
-		PortBigQuery:      9060,
-		OllamaHost:        "http://localhost:11434",
+		PortGCS:            4443,
+		PortPubSub:         8085,
+		PortSecretManager:  8086,
+		PortFirestore:      8088,
+		PortCloudTasks:     8089,
+		PortVertexAI:       8090,
+		PortKMS:            8091,
+		PortLogging:        8092,
+		PortCloudRun:       8093,
+		PortCloudScheduler: 8094,
+		PortSpanner:        9010,
+		PortBigtable:       9094,
+		PortCloudSQL:       5432,
+		PortMemorystore:    6379,
+		PortBigQuery:       9060,
+		OllamaHost:         "http://localhost:11434",
 	}
 }
 
