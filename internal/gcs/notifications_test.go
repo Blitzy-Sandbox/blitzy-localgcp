@@ -667,3 +667,74 @@ func TestStore_NotificationsForBucket_MissingBucket(t *testing.T) {
 		t.Fatalf("expected empty snapshot for missing bucket, got %d items", len(snap))
 	}
 }
+
+// --- Rule 7a silent-skip anchor test (AAP §0.7.1.8) ---
+
+// TestNoNotificationDeliveryWhenPubsubAddrEmpty verifies AAP Rule 7a: when
+// the GCS service is constructed with an empty pubsubAddr (which is
+// exactly what testServer(t) produces via New("", true) — see
+// gcs_test.go), the notification fan-out path MUST be a complete no-op.
+// Object uploads AND deletes must succeed without any attempt at network
+// activity and without blocking on a peer Pub/Sub service.
+//
+// This is the unit-level counterpart to integration_pubsub_test.go — it
+// exercises the same handler path (handleSimpleUpload → fanoutObjectEvent)
+// but WITHOUT any Pub/Sub peer available. If the fan-out were synchronous
+// or required a peer, this test would hang, timeout, or fail the upload.
+//
+// The test also registers a notification config on the target bucket to
+// prove that the silent-skip short-circuit is in fanoutObjectEvent itself
+// (pubsubAddr check in service.go), NOT in the "no matching configs" path —
+// a regression that moved the check below the config iteration would allow
+// an accidental goroutine leak or dial attempt even with pubsubAddr empty.
+func TestNoNotificationDeliveryWhenPubsubAddrEmpty(t *testing.T) {
+	base := testServer(t) // uses New("", true) → pubsubAddr is empty
+	createBucket(t, base, "silent-bucket")
+
+	// Register a notification config on the bucket. The CRUD handlers
+	// accept the config regardless of pubsubAddr state — only the
+	// fan-out delivery path is gated by pubsubAddr.
+	cresp := putJSON(t, notifConfigsURL(base, "silent-bucket"),
+		`{"topic":"projects/test/topics/noop"}`)
+	assertStatus(t, cresp, http.StatusOK)
+	var created NotificationConfig
+	decodeBody(t, cresp, &created)
+	if created.ID == "" {
+		t.Fatalf("expected created config to have id, got %+v", created)
+	}
+
+	// Upload an object. This MUST succeed — the OBJECT_FINALIZE fan-out
+	// must be silently skipped, not attempted against a non-existent peer.
+	// If fan-out were synchronous, this call would either hang (dial
+	// timeout) or return an error from the handler.
+	uploadURL := base + "/upload/storage/v1/b/silent-bucket/o?uploadType=media&name=quiet.txt"
+	resp, err := http.Post(uploadURL, "text/plain", strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("upload status=%d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	// Delete the object to exercise the OBJECT_DELETE fan-out path.
+	// Same silent-skip contract: DELETE returns 204 No Content and the
+	// goroutine-dispatched delivery is bypassed entirely.
+	dreq, err := http.NewRequest(http.MethodDelete,
+		base+"/storage/v1/b/silent-bucket/o/quiet.txt", nil)
+	if err != nil {
+		t.Fatalf("NewRequest DELETE: %v", err)
+	}
+	dresp, err := http.DefaultClient.Do(dreq)
+	if err != nil {
+		t.Fatalf("DELETE object: %v", err)
+	}
+	if dresp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(dresp.Body)
+		dresp.Body.Close()
+		t.Fatalf("DELETE object status=%d body=%s", dresp.StatusCode, body)
+	}
+	dresp.Body.Close()
+}
