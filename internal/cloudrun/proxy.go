@@ -72,6 +72,18 @@ type serviceProxy struct {
 	image        string                        // Docker image reference
 	internalPort string                        // internal container port, e.g. "8080/tcp"
 	hostPort     int                           // reverse-proxy listener port, from the pool
+	// args is the concatenated Command+Args slice extracted from the
+	// Cloud Run service template (see extractArgs in service.go).
+	// Forwarded to Docker as the container's CMD directive via
+	// orchestrator.ContainerConfig.Cmd at boot() time. Nil or empty
+	// means "use the image's default CMD" (QA Issue #1 fix).
+	args []string
+	// env is the flat "NAME=VALUE" slice extracted from the Cloud
+	// Run service template's EnvVar list (see extractEnv in
+	// service.go). Forwarded to Docker as additional environment
+	// variables via orchestrator.ContainerConfig.Env. Nil or empty
+	// means "use only the image's default env" (QA Issue #1 fix).
+	env          []string
 	runtime      orchestrator.ContainerRuntime // nil in --no-docker stub mode
 	store        *Store                        // persistence hook for ContainerID on successful boot
 	logger       *log.Logger
@@ -94,6 +106,15 @@ type serviceProxy struct {
 // (non-empty URI pointing at a real listener) — but every request on
 // that listener is answered with 503 Service Unavailable.
 //
+// args and env carry the Cloud Run service template's container
+// overrides, extracted by extractArgs / extractEnv in service.go.
+// They are forwarded to Docker at container-create time via
+// orchestrator.ContainerConfig.Cmd / Env so that user-supplied
+// command-line arguments (for example http-echo's `-text=...`) and
+// environment variables actually reach the running container. Both
+// may be nil, in which case the image's defaults are used unchanged.
+// (QA Issue #1 fix — see extractArgs/extractEnv for full rationale.)
+//
 // The store is threaded through so boot() can persist the Docker
 // container ID on the service's ContainerRef once the container has
 // been started. This closes the orphan window where a container could
@@ -101,7 +122,7 @@ type serviceProxy struct {
 // DeleteService's Stop + Remove calls). store may be nil in non-
 // standard wiring paths; when nil, the SetContainerID persistence
 // step is silently skipped.
-func newServiceProxy(name, image, internalPort string, hostPort int, runtime orchestrator.ContainerRuntime, store *Store, logger *log.Logger, quiet bool) *serviceProxy {
+func newServiceProxy(name, image, internalPort string, hostPort int, args, env []string, runtime orchestrator.ContainerRuntime, store *Store, logger *log.Logger, quiet bool) *serviceProxy {
 	if internalPort == "" {
 		internalPort = "8080/tcp"
 	}
@@ -113,6 +134,8 @@ func newServiceProxy(name, image, internalPort string, hostPort int, runtime orc
 		image:        image,
 		internalPort: internalPort,
 		hostPort:     hostPort,
+		args:         args,
+		env:          env,
 		runtime:      runtime,
 		store:        store,
 		logger:       logger,
@@ -284,10 +307,20 @@ func (p *serviceProxy) boot(ctx context.Context) error {
 	if findErr == nil && exists {
 		p.containerID = id
 	} else {
+		// Cmd and Env forward the Cloud Run service template's
+		// container overrides (extractArgs / extractEnv in
+		// service.go). Nil slices are treated as "use image
+		// defaults" by the orchestrator runtime. This is the
+		// direct fix for QA Issue #1 — args and env fields from
+		// the service template are now persisted onto the Docker
+		// container at creation time rather than being silently
+		// dropped.
 		newID, err := p.runtime.Create(ctx, orchestrator.ContainerConfig{
 			Name:         cname,
 			Image:        p.image,
 			InternalPort: p.internalPort,
+			Cmd:          p.args,
+			Env:          p.env,
 		})
 		if err != nil {
 			return fmt.Errorf("create container %s: %w", cname, err)

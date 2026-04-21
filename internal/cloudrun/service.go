@@ -245,6 +245,11 @@ func (s *Service) CreateService(ctx context.Context, req *runpb.CreateServiceReq
 	if internalPort == "" {
 		internalPort = defaultInternalPort
 	}
+	// Extract container override args (Command+Args) and env vars
+	// from the service template so the lazy-start proxy can forward
+	// them to Docker at container creation time. QA Issue #1 fix.
+	args := extractArgs(svc)
+	env := extractEnv(svc)
 	s.store.SetRef(name, &ContainerRef{
 		HostPort:     hostPort,
 		Image:        image,
@@ -257,7 +262,7 @@ func (s *Service) CreateService(ctx context.Context, req *runpb.CreateServiceReq
 	// The store is threaded through so boot() can persist the Docker
 	// container ID into ContainerRef.ContainerID once the container
 	// is successfully started (closes the orphan-container window).
-	proxy := newServiceProxy(name, image, internalPort, hostPort, s.proxyRuntime(), s.store, s.logger, s.quiet)
+	proxy := newServiceProxy(name, image, internalPort, hostPort, args, env, s.proxyRuntime(), s.store, s.logger, s.quiet)
 	proxyCtx := s.serveCtx
 	if proxyCtx == nil {
 		proxyCtx = context.Background()
@@ -408,6 +413,96 @@ func extractInternalPort(svc *runpb.Service) string {
 		return ""
 	}
 	return fmt.Sprintf("%d/tcp", ports[0].GetContainerPort())
+}
+
+// extractArgs returns the concatenated Command + Args slice from the
+// first container in the service template, or nil when neither is
+// specified. This powers the container's Docker CMD directive so
+// that user-supplied `args` (e.g. `["-text=hello from localgcp"]`
+// for http-echo) reach the running container.
+//
+// Mapping rationale (QA Issue #1 fix, aligned with AAP §0.1.1 Extension A):
+//
+//	The Cloud Run proto distinguishes Command (entrypoint override)
+//	from Args (args to entrypoint); the orchestrator's ContainerConfig
+//	exposes only a single Cmd []string field (mapped to Docker's CMD).
+//	Since Docker's CMD is the arguments passed to the image's
+//	ENTRYPOINT, concatenating Command + Args into Cmd preserves as
+//	much user intent as possible within the orchestrator's single-
+//	field model:
+//	  • Only Args set (common case): Cmd = [...Args] — exact fidelity.
+//	  • Only Command set: Cmd = [...Command] — passed as CMD arg list.
+//	  • Both set: Cmd = [...Command, ...Args] — Command entries first.
+//	A fully faithful Entrypoint override would require extending the
+//	orchestrator.ContainerConfig surface, which is out of scope for
+//	this fix.
+func extractArgs(svc *runpb.Service) []string {
+	tpl := svc.GetTemplate()
+	if tpl == nil {
+		return nil
+	}
+	containers := tpl.GetContainers()
+	if len(containers) == 0 {
+		return nil
+	}
+	c := containers[0]
+	command := c.GetCommand()
+	args := c.GetArgs()
+	if len(command) == 0 && len(args) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(command)+len(args))
+	out = append(out, command...)
+	out = append(out, args...)
+	return out
+}
+
+// extractEnv converts the first container's Cloud Run EnvVar list into
+// the flat "NAME=VALUE" string slice format expected by the
+// orchestrator's ContainerConfig.Env (which in turn maps to Docker's
+// container.Config.Env). QA Issue #1 fix, aligned with AAP §0.1.1
+// Extension A.
+//
+// Entries are filtered as follows:
+//   - Empty-Name entries are skipped (invalid per proto semantics).
+//   - ValueSource entries (Cloud Secret Manager references) are
+//     skipped because the emulator cannot resolve secrets; including
+//     them with an empty literal value would silently shadow the
+//     image's own default and confuse debugging.
+//
+// Returns nil when no literal env vars remain after filtering, so
+// that the proxy's ContainerConfig.Env stays nil (Docker then uses
+// only the image's declared env).
+func extractEnv(svc *runpb.Service) []string {
+	tpl := svc.GetTemplate()
+	if tpl == nil {
+		return nil
+	}
+	containers := tpl.GetContainers()
+	if len(containers) == 0 {
+		return nil
+	}
+	envVars := containers[0].GetEnv()
+	if len(envVars) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(envVars))
+	for _, ev := range envVars {
+		name := ev.GetName()
+		if name == "" {
+			continue
+		}
+		// Skip Cloud Secret Manager references; the emulator
+		// cannot resolve them.
+		if ev.GetValueSource() != nil {
+			continue
+		}
+		out = append(out, name+"="+ev.GetValue())
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // completedOp wraps a result in an immediately-completed long-running
