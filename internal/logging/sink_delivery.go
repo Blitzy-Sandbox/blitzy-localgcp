@@ -174,8 +174,21 @@ func uploadEntryToGcs(gcsAddr string, sink Sink, entry *loggingpb.LogEntry) erro
 	}
 
 	// Build a deterministic object name: {sink-short}/{YYYY-MM-DD}/{ts}-{id}.json
+	//
+	// Defensive zero-time handling: (*timestamppb.Timestamp).AsTime() is
+	// nil-safe but when the receiver is nil (i.e. the LogEntry had no
+	// Timestamp field) the returned value is time.Unix(0, 0).UTC() — a
+	// *valid* non-zero Go time representing the Unix epoch (1970-01-01
+	// 00:00:00 UTC). Go's time.Time zero value (time.Time{}, detected by
+	// IsZero()) is distinct from the Unix epoch, so a bare IsZero check
+	// would let nil-timestamp entries shard into a bogus 1970-01-01
+	// bucket. Treat any of the following as "missing timestamp" and fall
+	// back to the current wall-clock time: the proto pointer is nil, the
+	// Go time is the zero value, or the time is exactly the Unix epoch
+	// (no LogEntry in practice carries a legitimate 1970-01-01 timestamp
+	// and the real Cloud Logging API rejects such values outright).
 	ts := entry.GetTimestamp().AsTime()
-	if ts.IsZero() {
+	if entry.GetTimestamp() == nil || ts.IsZero() || ts.Unix() == 0 {
 		ts = Now()
 	}
 	shortSink := sink.Name
