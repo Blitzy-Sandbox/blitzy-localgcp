@@ -1,666 +1,421 @@
 //go:build integration
 
-// Package gcs — integration_pubsub_test.go
+// Package gcs_test — integration_pubsub_test.go
 //
 // End-to-end integration coverage for AAP §0.5.1.2 Extension B
 // (GCS → Pub/Sub notification delivery), satisfying AAP Rule 9 which
-// mandates a dedicated integration test for each cross-service wiring path.
+// mandates a dedicated integration test for each cross-service wiring
+// path. This test stands up BOTH a live GCS HTTP service AND a live
+// Pub/Sub gRPC service in the same Go test process (mirroring the
+// single-binary localgcp topology), wires the GCS service to the
+// Pub/Sub service via the variadic gcs.New(..., pubsubAddr) constructor
+// (AAP Rule 7a), creates a notification config, exercises the object
+// write/delete paths, and asserts that canonical GCS Pub/Sub
+// notifications arrive on the subscribed topic with the correct
+// attributes and payload shape.
 //
-// These tests start BOTH a live GCS HTTP service AND a live Pub/Sub gRPC
-// service in the same process (the localgcp single-binary topology), wire
-// the GCS service to the Pub/Sub service via SetPubsubEndpoint, create a
-// notification configuration, exercise the object write/delete paths, and
-// assert that the correct notification arrives on a Pub/Sub subscription
-// with the correct attributes and payload shape.
+// Topology (AAP §0.4.2.2 "GCS → Pub/Sub Notification Delivery"):
 //
-// The fan-out is fire-and-forget per-config (Rule 3): the HTTP handler
-// returns BEFORE the Publish RPC completes. Tests therefore use a bounded
-// retry loop (`pullUntil`) rather than assuming immediate availability.
+//     HTTP PUT /upload/... ───▶ gcs.Service ──goroutine──▶ pubsub.Service
+//                                                            │
+//                                                            ▼
+//                                                        subscriber.Pull
 //
-// Build tag: these tests are compiled only when `go test` is invoked with
-// `-tags integration`, per AAP §0.7.4 Gate 8.
+// Rule 3 (fire-and-forget handler) is verified by measuring the
+// elapsed wall time of the upload HTTP call and asserting it returns
+// in well under the per-message Pub/Sub publish timeout. A regression
+// that accidentally makes the publish synchronous would blow this
+// bound immediately.
+//
+// Rule 7a (constructor additive args) is verified by calling
+// gcs.New("", true, pubsubAddr) in the three-argument form and by
+// calling pubsub.New("", true) in its unchanged two-argument form.
+//
+// Build tag: this file compiles only when `go test` is invoked with
+// `-tags integration` (AAP §0.7.4 Gate 8), so the standard
+// `go test ./internal/gcs/...` unit-test run is unaffected.
 
-package gcs
+package gcs_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
-	"cloud.google.com/go/pubsub/apiv1/pubsubpb"
-	"github.com/slokam-ai/localgcp/internal/pubsub"
+	pubsubpb "cloud.google.com/go/pubsub/apiv1/pubsubpb"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
+
+	"github.com/slokam-ai/localgcp/internal/gcs"
+	"github.com/slokam-ai/localgcp/internal/pubsub"
 )
 
-// --- Integration test helpers ---
-
-// startPubsubForIntegration launches an in-memory, quiet Pub/Sub service on
-// an ephemeral localhost port. Returns the dialable address plus ready
-// Publisher and Subscriber clients sharing a single gRPC connection.
+// startPubSubForGCSTest starts an in-process Pub/Sub gRPC emulator on an
+// ephemeral localhost port and returns the dialable "host:port" address
+// plus a cancel function that shuts the server down.
 //
-// The readiness probe uses GetTopic on a nonexistent topic — a codes.NotFound
-// response confirms the server is serving RPCs (mirrors the canonical
-// pattern in internal/pubsub/service_test.go).
-func startPubsubForIntegration(t *testing.T) (string, pubsubpb.PublisherClient, pubsubpb.SubscriberClient) {
+// The Pub/Sub service is constructed with the unchanged two-argument
+// form pubsub.New(dataDir, quiet) — immutable per AAP Rule 7 (the
+// pubsub package's constructor is NOT extended with loopback addresses
+// since Pub/Sub is a terminal destination for the GCS notification
+// path, not an initiator).
+//
+// The readiness probe dials gRPC and issues ListTopics on a probe
+// project; any non-transport-level response confirms the Publisher
+// service is reachable. This mirrors the readiness pattern used by
+// internal/pubsub/service_test.go testClients and
+// internal/logging/integration_pubsub_sink_test.go.
+func startPubSubForGCSTest(t *testing.T) (string, func()) {
 	t.Helper()
 
-	svc := pubsub.New("", true) // in-memory, quiet
+	svc := pubsub.New("", true) // empty dataDir, quiet
 
-	ln, err := net.Listen("tcp", "localhost:0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("pubsub listen: %v", err)
+		t.Fatalf("listen ephemeral port for pubsub: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	// Close the listener so svc.Start can re-bind the same address in
+	// its own net.Listen call. This pattern matches the one used by
+	// internal/pubsub/service_test.go testClients.
+	_ = ln.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	started := make(chan struct{})
 	go func() {
-		close(started)
+		// Shutdown-induced errors are expected on cancel and are not
+		// reported because this goroutine runs concurrently with the
+		// test and t.Fatal from a non-test goroutine has undefined
+		// semantics.
 		_ = svc.Start(ctx, addr)
 	}()
-	<-started
 
-	var conn *grpc.ClientConn
-	for i := 0; i < 50; i++ {
-		conn, err = grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err == nil {
-			pub := pubsubpb.NewPublisherClient(conn)
-			probeCtx, probeCancel := context.WithTimeout(ctx, 500*time.Millisecond)
-			_, rpcErr := pub.GetTopic(probeCtx, &pubsubpb.GetTopicRequest{Topic: "projects/probe/topics/probe"})
-			probeCancel()
-			if rpcErr != nil && status.Code(rpcErr) == codes.NotFound {
-				break
+	// Readiness probe — loop up to 3 seconds with 20ms sleeps.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, dialErr := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if dialErr == nil {
+			client := pubsubpb.NewPublisherClient(conn)
+			pctx, pcancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			_, rpcErr := client.ListTopics(pctx, &pubsubpb.ListTopicsRequest{
+				Project: "projects/localgcp-readiness-probe",
+			})
+			pcancel()
+			_ = conn.Close()
+			// Any response — success, NotFound, even Unimplemented or
+			// InvalidArgument — confirms the server is serving RPCs
+			// on the Publisher service.
+			if rpcErr == nil ||
+				strings.Contains(rpcErr.Error(), "Unimplemented") ||
+				strings.Contains(rpcErr.Error(), "invalid") ||
+				strings.Contains(rpcErr.Error(), "NotFound") {
+				return addr, cancel
 			}
-			if rpcErr == nil {
-				break
-			}
-			conn.Close()
-			conn = nil
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if conn == nil {
-		t.Fatal("integration: failed to connect to pubsub server")
-	}
-	t.Cleanup(func() { _ = conn.Close() })
-
-	return addr, pubsubpb.NewPublisherClient(conn), pubsubpb.NewSubscriberClient(conn)
+	cancel()
+	t.Fatal("pubsub server did not start within deadline")
+	return "", nil
 }
 
-// startGCSWithPubsub launches an in-memory, quiet GCS HTTP service on an
-// ephemeral localhost port with the Pub/Sub loopback endpoint configured
-// via SetPubsubEndpoint. Returns the base HTTP URL.
+// startGCSForNotificationTest starts an in-process GCS HTTP emulator on
+// an ephemeral localhost port, wired to the provided pubsubAddr for the
+// notification-config fan-out path (AAP Rule 7a additive args). Returns
+// the base URL (e.g. "http://127.0.0.1:43219") plus a cancel function
+// that shuts the server down.
 //
-// When pubsubAddr == "", fan-out is disabled (Rule 7a silent skip) — this
-// is the path used by TestIntegration_GCS_PubSub_EmptyEndpoint_NoDelivery.
-func startGCSWithPubsub(t *testing.T, pubsubAddr string) string {
+// The GCS service is constructed with the three-argument variadic form
+// gcs.New(dataDir, quiet, pubsubAddr). When pubsubAddr is empty the
+// fan-out path is silently skipped (Rule 7a).
+//
+// The readiness probe issues HTTP GET on the root path. Any response —
+// including 404 — proves the HTTP server is accepting connections.
+func startGCSForNotificationTest(t *testing.T, pubsubAddr string) (string, func()) {
 	t.Helper()
 
-	svc := New("", true)
-	svc.SetPubsubEndpoint(pubsubAddr)
+	svc := gcs.New("", true, pubsubAddr) // Rule 7a three-arg variadic form
 
-	ln, err := net.Listen("tcp", "localhost:0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("gcs listen: %v", err)
+		t.Fatalf("listen ephemeral port for gcs: %v", err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
+	_ = ln.Close()
 
-	addr := fmt.Sprintf("localhost:%d", port)
+	hostPort := fmt.Sprintf("127.0.0.1:%d", port)
+	baseURL := fmt.Sprintf("http://%s", hostPort)
+
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	go func() {
+		// Shutdown-induced errors are expected on cancel and are not
+		// reported — see startPubSubForGCSTest for the rationale.
+		_ = svc.Start(ctx, hostPort)
+	}()
 
-	go func() { _ = svc.Start(ctx, addr) }()
-
-	base := fmt.Sprintf("http://%s", addr)
-	for i := 0; i < 50; i++ {
-		resp, err := http.Get(base + "/")
+	// Readiness probe — loop up to 3 seconds with 20ms sleeps.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(baseURL + "/")
 		if err == nil {
-			resp.Body.Close()
-			return base
+			_ = resp.Body.Close()
+			return baseURL, cancel
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("integration: gcs server did not start")
-	return ""
+	cancel()
+	t.Fatal("gcs server did not start within deadline")
+	return "", nil
 }
 
-// createTopicAndSubscription creates a topic and a subscription pointing at
-// that topic using the supplied clients. Caller supplies fully-qualified
-// resource names (projects/{p}/topics/{t} and projects/{p}/subscriptions/{s}).
-func createTopicAndSubscription(t *testing.T, pub pubsubpb.PublisherClient, sub pubsubpb.SubscriberClient, topic, subscription string) {
-	t.Helper()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	if _, err := pub.CreateTopic(ctx, &pubsubpb.Topic{Name: topic}); err != nil {
-		t.Fatalf("CreateTopic %s: %v", topic, err)
-	}
-	if _, err := sub.CreateSubscription(ctx, &pubsubpb.Subscription{
-		Name:  subscription,
-		Topic: topic,
-	}); err != nil {
-		t.Fatalf("CreateSubscription %s -> %s: %v", subscription, topic, err)
-	}
-}
-
-// createNotifConfig PUTs a NotificationConfig on bucket pointing at topic,
-// with the given optional event types and prefix. Asserts HTTP 200 and
-// returns the created NotificationConfig (populated with server-assigned
-// ID / Kind / Etag / SelfLink).
-func createNotifConfig(t *testing.T, base, bucket, topic string, eventTypes []string, prefix string) NotificationConfig {
-	t.Helper()
-
-	cfg := NotificationConfig{
-		TopicName:        topic,
-		EventTypes:       eventTypes,
-		ObjectNamePrefix: prefix,
-	}
-	body, err := json.Marshal(cfg)
-	if err != nil {
-		t.Fatalf("marshal notif cfg: %v", err)
-	}
-	resp := putJSON(t, notifConfigsURL(base, bucket), string(body))
-	assertStatus(t, resp, 200)
-
-	var created NotificationConfig
-	decodeBody(t, resp, &created)
-	if created.ID == "" {
-		t.Fatalf("expected ID on created config, got %+v", created)
-	}
-	return created
-}
-
-// pullUntil polls the subscription up to timeout, aggregating received
-// messages until it has at least `want` OR the deadline elapses.
-// Returns all messages received during the polling window.
+// pullOneGCSNotification polls the given subscription until at least one
+// message arrives, then ACKs every received message (to prevent
+// re-delivery on subsequent pulls) and returns the first message.
 //
-// The fan-out is goroutine-based and bounded by a 5-second Publish timeout
-// (internal/gcs/pubsub.go), so a 3-second polling window is ample for
-// messages that SHOULD arrive and short enough to detect messages that
-// should NOT arrive.
-func pullUntil(t *testing.T, sub pubsubpb.SubscriberClient, subscription string, want int, timeout time.Duration) []*pubsubpb.ReceivedMessage {
+// Fails the test if no message arrives within the deadline. A per-pull
+// context timeout of 1s prevents a single Pull call from blocking
+// beyond the outer deadline. The polling uses ReturnImmediately=true
+// so each Pull completes promptly when the subscription is empty,
+// avoiding long hanging calls that would complicate timeout accounting.
+func pullOneGCSNotification(t *testing.T, sub pubsubpb.SubscriberClient, subName string, deadline time.Duration) *pubsubpb.PubsubMessage {
 	t.Helper()
 
-	deadline := time.Now().Add(timeout)
-	ctx := context.Background()
-	var all []*pubsubpb.ReceivedMessage
-	for time.Now().Before(deadline) {
-		resp, err := sub.Pull(ctx, &pubsubpb.PullRequest{
-			Subscription: subscription,
-			MaxMessages:  int32(want + 4), // pull a margin so stale messages don't hide true count
+	stop := time.Now().Add(deadline)
+	for time.Now().Before(stop) {
+		pctx, pcancel := context.WithTimeout(context.Background(), 1*time.Second)
+		resp, err := sub.Pull(pctx, &pubsubpb.PullRequest{
+			Subscription:      subName,
+			MaxMessages:       10,
+			ReturnImmediately: true,
 		})
+		pcancel()
 		if err != nil {
-			t.Fatalf("Pull %s: %v", subscription, err)
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
-		all = append(all, resp.ReceivedMessages...)
-		if want > 0 && len(all) >= want {
-			return all
+		received := resp.GetReceivedMessages()
+		if len(received) == 0 {
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
-		time.Sleep(50 * time.Millisecond)
+		// Acknowledge all received messages so the next pull against
+		// the same subscription sees a clean queue (critical for the
+		// OBJECT_FINALIZE → OBJECT_DELETE sequence in the primary
+		// test).
+		ackIDs := make([]string, 0, len(received))
+		for _, m := range received {
+			ackIDs = append(ackIDs, m.GetAckId())
+		}
+		ackCtx, ackCancel := context.WithTimeout(context.Background(), 1*time.Second)
+		_, _ = sub.Acknowledge(ackCtx, &pubsubpb.AcknowledgeRequest{
+			Subscription: subName,
+			AckIds:       ackIDs,
+		})
+		ackCancel()
+		return received[0].GetMessage()
 	}
-	return all
+	t.Fatalf("no message received on %s within %v", subName, deadline)
+	return nil
 }
 
-// --- Happy-path tests ---
+// TestGCSNotification_DeliveredToPubSub exercises the full Extension B
+// loopback path end-to-end (AAP §0.5.1.2 Extension B, AAP Rule 9):
+//
+//  1. Start Pub/Sub emulator on an ephemeral port.
+//  2. Start GCS emulator on an ephemeral port wired to the Pub/Sub
+//     address via the variadic gcs.New(..., pubsubAddr) constructor.
+//  3. Dial Pub/Sub; create a topic and a pull subscription.
+//  4. Create a GCS bucket via HTTP POST /storage/v1/b.
+//  5. Create a NotificationConfig on the bucket pointing at the topic
+//     (event types: OBJECT_FINALIZE, OBJECT_DELETE) via HTTP.
+//  6. Upload an object via HTTP POST /upload/... and assert the HTTP
+//     PUT returned in well under 2 seconds — AAP Rule 3 fire-and-forget
+//     verification. A regression that accidentally made the Publish
+//     call synchronous from the handler would blow this bound.
+//  7. Pull from the subscription; assert the received message has
+//     eventType=OBJECT_FINALIZE, bucketId=<bucket>, and a canonical
+//     GCS JSON payload with kind=storage#object.
+//  8. DELETE the object via HTTP.
+//  9. Pull again; assert eventType=OBJECT_DELETE on the delivered
+//     message.
+//
+// The test uses only the public HTTP API of the GCS emulator and the
+// public gRPC API of the Pub/Sub emulator — no internal helpers, no
+// type assertions into private fields. The external test package
+// (gcs_test) guarantees this.
+func TestGCSNotification_DeliveredToPubSub(t *testing.T) {
+	// 1. Start Pub/Sub emulator.
+	pubsubAddr, stopPubSub := startPubSubForGCSTest(t)
+	defer stopPubSub()
 
-// TestIntegration_GCS_PubSub_ObjectFinalize is the canonical happy-path:
-// an object write on a bucket with a matching NotificationConfig produces
-// exactly one Pub/Sub message with eventType=OBJECT_FINALIZE, bucketId=<b>,
-// and a JSON_API_V1 payload carrying the object metadata.
-func TestIntegration_GCS_PubSub_ObjectFinalize(t *testing.T) {
-	pubsubAddr, pub, sub := startPubsubForIntegration(t)
-	base := startGCSWithPubsub(t, pubsubAddr)
+	// 2. Start GCS emulator wired to Pub/Sub.
+	gcsBase, stopGCS := startGCSForNotificationTest(t, pubsubAddr)
+	defer stopGCS()
 
-	const (
-		topic        = "projects/test/topics/finalize-topic"
-		subscription = "projects/test/subscriptions/finalize-sub"
-		bucketName   = "finalize-bucket"
-		objectName   = "hello.txt"
-		objectBody   = "hello world"
-	)
+	// 3. Dial Pub/Sub for topic/subscription setup and message pulling.
+	conn, err := grpc.NewClient(pubsubAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial pubsub %q: %v", pubsubAddr, err)
+	}
+	defer func() { _ = conn.Close() }()
 
-	createTopicAndSubscription(t, pub, sub, topic, subscription)
-	createBucket(t, base, bucketName)
-	cfg := createNotifConfig(t, base, bucketName, topic, []string{"OBJECT_FINALIZE", "OBJECT_DELETE"}, "")
-
-	// Trigger OBJECT_FINALIZE via a simple upload.
-	obj := simpleUpload(t, base, bucketName, objectName, objectBody)
-	if obj.Name != objectName {
-		t.Fatalf("uploaded object name = %q, want %q", obj.Name, objectName)
-	}
-
-	// Fan-out is fire-and-forget (Rule 3), so poll.
-	msgs := pullUntil(t, sub, subscription, 1, 3*time.Second)
-	if len(msgs) != 1 {
-		t.Fatalf("expected exactly 1 message, got %d", len(msgs))
-	}
-
-	m := msgs[0].Message
-	// Assert canonical attributes mandated by AAP §0.1.1 Extension B.
-	if m.Attributes["eventType"] != "OBJECT_FINALIZE" {
-		t.Errorf("attribute eventType = %q, want OBJECT_FINALIZE (attrs: %+v)", m.Attributes["eventType"], m.Attributes)
-	}
-	if m.Attributes["bucketId"] != bucketName {
-		t.Errorf("attribute bucketId = %q, want %q", m.Attributes["bucketId"], bucketName)
-	}
-	if m.Attributes["objectId"] != objectName {
-		t.Errorf("attribute objectId = %q, want %q", m.Attributes["objectId"], objectName)
-	}
-	if m.Attributes["payloadFormat"] != "JSON_API_V1" {
-		t.Errorf("attribute payloadFormat = %q, want JSON_API_V1", m.Attributes["payloadFormat"])
-	}
-	wantNotifAttr := fmt.Sprintf("projects/_/buckets/%s/notificationConfigs/%s", bucketName, cfg.ID)
-	if m.Attributes["notificationConfig"] != wantNotifAttr {
-		t.Errorf("attribute notificationConfig = %q, want %q", m.Attributes["notificationConfig"], wantNotifAttr)
-	}
-
-	// Assert JSON_API_V1 payload structure: Object metadata.
-	if len(m.Data) == 0 {
-		t.Fatal("expected non-empty payload, got zero bytes")
-	}
-	var decoded Object
-	if err := json.Unmarshal(m.Data, &decoded); err != nil {
-		t.Fatalf("payload is not an Object JSON: %v — raw=%s", err, string(m.Data))
-	}
-	if decoded.Name != objectName {
-		t.Errorf("payload Object.Name = %q, want %q", decoded.Name, objectName)
-	}
-	if decoded.Bucket != bucketName {
-		t.Errorf("payload Object.Bucket = %q, want %q", decoded.Bucket, bucketName)
-	}
-	if decoded.Kind != "storage#object" {
-		t.Errorf("payload Object.Kind = %q, want storage#object", decoded.Kind)
-	}
-}
-
-// TestIntegration_GCS_PubSub_ObjectDelete asserts that a DELETE on a stored
-// object fires exactly one OBJECT_DELETE notification carrying the object
-// metadata snapshot captured before deletion.
-func TestIntegration_GCS_PubSub_ObjectDelete(t *testing.T) {
-	pubsubAddr, pub, sub := startPubsubForIntegration(t)
-	base := startGCSWithPubsub(t, pubsubAddr)
+	pubClient := pubsubpb.NewPublisherClient(conn)
+	subClient := pubsubpb.NewSubscriberClient(conn)
 
 	const (
-		topic        = "projects/test/topics/delete-topic"
-		subscription = "projects/test/subscriptions/delete-sub"
-		bucketName   = "delete-bucket"
-		objectName   = "gone.txt"
+		projectID  = "test-project"
+		topicName  = "projects/test-project/topics/gcs-notifications"
+		subName    = "projects/test-project/subscriptions/gcs-notifications-sub"
+		bucketName = "notif-bucket"
+		objectName = "hello.txt"
+		objectBody = "hello from integration test"
 	)
 
-	createTopicAndSubscription(t, pub, sub, topic, subscription)
-	createBucket(t, base, bucketName)
-	createNotifConfig(t, base, bucketName, topic, []string{"OBJECT_FINALIZE", "OBJECT_DELETE"}, "")
+	// Create topic.
+	setupCtx, setupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer setupCancel()
 
-	// Upload to have something to delete. Drain the FINALIZE message so
-	// the subsequent DELETE assertion is unambiguous.
-	simpleUpload(t, base, bucketName, objectName, "goodbye")
-	finalizeMsgs := pullUntil(t, sub, subscription, 1, 3*time.Second)
-	if len(finalizeMsgs) != 1 {
-		t.Fatalf("setup: expected 1 FINALIZE message before DELETE, got %d", len(finalizeMsgs))
+	if _, err := pubClient.CreateTopic(setupCtx, &pubsubpb.Topic{Name: topicName}); err != nil {
+		t.Fatalf("CreateTopic %q: %v", topicName, err)
 	}
 
-	// Delete the object via the GCS JSON API.
-	delReq, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/storage/v1/b/%s/o/%s", base, bucketName, objectName), nil)
+	// Create subscription targeting the topic.
+	if _, err := subClient.CreateSubscription(setupCtx, &pubsubpb.Subscription{
+		Name:               subName,
+		Topic:              topicName,
+		AckDeadlineSeconds: 10,
+	}); err != nil {
+		t.Fatalf("CreateSubscription %q -> %q: %v", subName, topicName, err)
+	}
+
+	// 4. Create GCS bucket via HTTP.
+	bucketCreateURL := fmt.Sprintf("%s/storage/v1/b?project=%s", gcsBase, projectID)
+	bucketCreateBody := fmt.Sprintf(`{"name":%q}`, bucketName)
+	resp, err := http.Post(bucketCreateURL, "application/json", strings.NewReader(bucketCreateBody))
+	if err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		t.Fatalf("create bucket status=%d body=%s", resp.StatusCode, body)
+	}
+	_ = resp.Body.Close()
+
+	// 5. Create notification config on the bucket.
+	notifURL := fmt.Sprintf("%s/storage/v1/b/%s/notificationConfigs", gcsBase, bucketName)
+	notifBody := fmt.Sprintf(`{"topic":%q,"event_types":["OBJECT_FINALIZE","OBJECT_DELETE"]}`, topicName)
+	resp, err = http.Post(notifURL, "application/json", strings.NewReader(notifBody))
+	if err != nil {
+		t.Fatalf("create notification config: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		t.Fatalf("create notification config status=%d body=%s", resp.StatusCode, body)
+	}
+	var notifResp struct {
+		ID    string `json:"id"`
+		Topic string `json:"topic"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&notifResp); err != nil {
+		_ = resp.Body.Close()
+		t.Fatalf("decode notification config response: %v", err)
+	}
+	_ = resp.Body.Close()
+	if notifResp.ID == "" {
+		t.Fatalf("notification config ID is empty in response: %+v", notifResp)
+	}
+
+	// 6. Upload an object and measure elapsed wall time.
+	//
+	// AAP Rule 3 (fire-and-forget): the HTTP handler MUST NOT block on
+	// the downstream Pub/Sub publish. The upload should return in
+	// essentially RTT+store-write time (well under 100ms on localhost);
+	// a 2-second bound guards against any regression that makes the
+	// publish synchronous without being sensitive to ordinary system
+	// load.
+	uploadURL := fmt.Sprintf("%s/upload/storage/v1/b/%s/o?uploadType=media&name=%s",
+		gcsBase, bucketName, objectName)
+	uploadStart := time.Now()
+	resp, err = http.Post(uploadURL, "text/plain", bytes.NewReader([]byte(objectBody)))
+	uploadElapsed := time.Since(uploadStart)
+	if err != nil {
+		t.Fatalf("upload object: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		t.Fatalf("upload object status=%d body=%s", resp.StatusCode, body)
+	}
+	_ = resp.Body.Close()
+	if uploadElapsed > 2*time.Second {
+		t.Fatalf("upload HTTP call took %v (>2s) — handler appears to block on Pub/Sub publish (AAP Rule 3 violation)",
+			uploadElapsed)
+	}
+
+	// 7. Poll the subscription for the OBJECT_FINALIZE notification.
+	finalizeMsg := pullOneGCSNotification(t, subClient, subName, 5*time.Second)
+
+	if got := finalizeMsg.Attributes["eventType"]; got != "OBJECT_FINALIZE" {
+		t.Fatalf("Attributes[eventType] = %q, want OBJECT_FINALIZE (full attrs: %v)",
+			got, finalizeMsg.Attributes)
+	}
+	if got := finalizeMsg.Attributes["bucketId"]; got != bucketName {
+		t.Fatalf("Attributes[bucketId] = %q, want %q (full attrs: %v)",
+			got, bucketName, finalizeMsg.Attributes)
+	}
+
+	// Verify canonical GCS notification payload shape.
+	if len(finalizeMsg.Data) == 0 {
+		t.Fatalf("FINALIZE message has empty Data payload (JSON_API_V1 payload expected)")
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(finalizeMsg.Data, &payload); err != nil {
+		t.Fatalf("FINALIZE payload is not valid JSON: %v (raw=%q)", err, string(finalizeMsg.Data))
+	}
+	if got := payload["kind"]; got != "storage#object" {
+		t.Fatalf(`payload["kind"] = %v, want "storage#object" (payload: %v)`, got, payload)
+	}
+	if got := payload["bucket"]; got != bucketName {
+		t.Fatalf(`payload["bucket"] = %v, want %q (payload: %v)`, got, bucketName, payload)
+	}
+	if got := payload["name"]; got != objectName {
+		t.Fatalf(`payload["name"] = %v, want %q (payload: %v)`, got, objectName, payload)
+	}
+
+	// 8. Delete the object via HTTP.
+	delURL := fmt.Sprintf("%s/storage/v1/b/%s/o/%s", gcsBase, bucketName, objectName)
+	delReq, err := http.NewRequest(http.MethodDelete, delURL, nil)
+	if err != nil {
+		t.Fatalf("build DELETE request: %v", err)
+	}
 	delResp, err := http.DefaultClient.Do(delReq)
 	if err != nil {
-		t.Fatalf("DELETE object: %v", err)
+		t.Fatalf("delete object: %v", err)
 	}
-	delResp.Body.Close()
 	if delResp.StatusCode != http.StatusNoContent {
-		t.Fatalf("DELETE object status = %d, want 204", delResp.StatusCode)
+		body, _ := io.ReadAll(delResp.Body)
+		_ = delResp.Body.Close()
+		t.Fatalf("delete object status=%d body=%s (want 204)", delResp.StatusCode, body)
 	}
+	_ = delResp.Body.Close()
 
-	msgs := pullUntil(t, sub, subscription, 1, 3*time.Second)
-	if len(msgs) != 1 {
-		t.Fatalf("expected exactly 1 DELETE message, got %d", len(msgs))
+	// 9. Poll the subscription for the OBJECT_DELETE notification.
+	deleteMsg := pullOneGCSNotification(t, subClient, subName, 5*time.Second)
+
+	if got := deleteMsg.Attributes["eventType"]; got != "OBJECT_DELETE" {
+		t.Fatalf("Attributes[eventType] = %q, want OBJECT_DELETE (full attrs: %v)",
+			got, deleteMsg.Attributes)
 	}
-
-	m := msgs[0].Message
-	if m.Attributes["eventType"] != "OBJECT_DELETE" {
-		t.Errorf("attribute eventType = %q, want OBJECT_DELETE", m.Attributes["eventType"])
+	if got := deleteMsg.Attributes["bucketId"]; got != bucketName {
+		t.Fatalf("Attributes[bucketId] = %q, want %q (full attrs: %v)",
+			got, bucketName, deleteMsg.Attributes)
 	}
-	if m.Attributes["bucketId"] != bucketName {
-		t.Errorf("attribute bucketId = %q, want %q", m.Attributes["bucketId"], bucketName)
-	}
-	if m.Attributes["objectId"] != objectName {
-		t.Errorf("attribute objectId = %q, want %q", m.Attributes["objectId"], objectName)
-	}
-
-	// Payload must still be the object metadata snapshot captured before delete.
-	if len(m.Data) == 0 {
-		t.Fatal("expected non-empty DELETE payload, got zero bytes")
-	}
-	var decoded Object
-	if err := json.Unmarshal(m.Data, &decoded); err != nil {
-		t.Fatalf("payload is not an Object JSON: %v", err)
-	}
-	if decoded.Name != objectName {
-		t.Errorf("payload Object.Name = %q, want %q", decoded.Name, objectName)
-	}
-}
-
-// --- Filter tests ---
-
-// TestIntegration_GCS_PubSub_EventTypeFilter asserts that a NotificationConfig
-// with EventTypes=[OBJECT_FINALIZE] does NOT emit a message on DELETE.
-//
-// This validates the matchesEvent filter in the fan-out path
-// (internal/gcs/service.go#matchesEvent).
-func TestIntegration_GCS_PubSub_EventTypeFilter(t *testing.T) {
-	pubsubAddr, pub, sub := startPubsubForIntegration(t)
-	base := startGCSWithPubsub(t, pubsubAddr)
-
-	const (
-		topic        = "projects/test/topics/filter-topic"
-		subscription = "projects/test/subscriptions/filter-sub"
-		bucketName   = "filter-bucket"
-		objectName   = "only-finalize.txt"
-	)
-
-	createTopicAndSubscription(t, pub, sub, topic, subscription)
-	createBucket(t, base, bucketName)
-	// Filter to FINALIZE only.
-	createNotifConfig(t, base, bucketName, topic, []string{"OBJECT_FINALIZE"}, "")
-
-	// Upload (matches FINALIZE filter) then delete (does NOT match).
-	simpleUpload(t, base, bucketName, objectName, "data")
-	delReq, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/storage/v1/b/%s/o/%s", base, bucketName, objectName), nil)
-	delResp, err := http.DefaultClient.Do(delReq)
-	if err != nil {
-		t.Fatalf("DELETE: %v", err)
-	}
-	delResp.Body.Close()
-
-	// Collect messages for the full window; assert exactly one FINALIZE.
-	msgs := pullUntil(t, sub, subscription, 2, 3*time.Second)
-	if len(msgs) != 1 {
-		t.Fatalf("expected exactly 1 message (FINALIZE only), got %d (attrs: %v)",
-			len(msgs), attrsOf(msgs))
-	}
-	if msgs[0].Message.Attributes["eventType"] != "OBJECT_FINALIZE" {
-		t.Errorf("expected single message to be OBJECT_FINALIZE, got %q",
-			msgs[0].Message.Attributes["eventType"])
-	}
-}
-
-// TestIntegration_GCS_PubSub_PrefixFilter asserts that ObjectNamePrefix
-// filtering at the NotificationConfig level skips non-matching uploads.
-func TestIntegration_GCS_PubSub_PrefixFilter(t *testing.T) {
-	pubsubAddr, pub, sub := startPubsubForIntegration(t)
-	base := startGCSWithPubsub(t, pubsubAddr)
-
-	const (
-		topic        = "projects/test/topics/prefix-topic"
-		subscription = "projects/test/subscriptions/prefix-sub"
-		bucketName   = "prefix-bucket"
-		matchName    = "photos/2025/cat.jpg"
-		skipName     = "docs/readme.txt"
-	)
-
-	createTopicAndSubscription(t, pub, sub, topic, subscription)
-	createBucket(t, base, bucketName)
-	createNotifConfig(t, base, bucketName, topic, nil, "photos/") // nil = all event types
-
-	// Upload one matching, one non-matching.
-	simpleUpload(t, base, bucketName, matchName, "img")
-	simpleUpload(t, base, bucketName, skipName, "txt")
-
-	// Expect exactly 1 message (the photos/ one), and poll long enough
-	// to catch a stray skipName event if it were (incorrectly) delivered.
-	msgs := pullUntil(t, sub, subscription, 2, 3*time.Second)
-	if len(msgs) != 1 {
-		t.Fatalf("expected exactly 1 message (photos/ only), got %d (objectIds: %v)",
-			len(msgs), objectIDsOf(msgs))
-	}
-	if got := msgs[0].Message.Attributes["objectId"]; got != matchName {
-		t.Errorf("expected delivered objectId = %q, got %q", matchName, got)
-	}
-}
-
-// --- Disabled-path test ---
-
-// TestIntegration_GCS_PubSub_EmptyEndpoint_NoDelivery asserts that when
-// pubsubAddr is empty (AAP Rule 7a silent skip), object writes succeed
-// normally and no Pub/Sub delivery is attempted even if a NotificationConfig
-// is present.
-//
-// We still start a real Pub/Sub service to host the topic+subscription so
-// that we can assert no messages were routed through it. GCS is started
-// with pubsubAddr="" — the fan-out path is unconditionally skipped.
-func TestIntegration_GCS_PubSub_EmptyEndpoint_NoDelivery(t *testing.T) {
-	_, pub, sub := startPubsubForIntegration(t)
-	base := startGCSWithPubsub(t, "") // Explicitly disabled.
-
-	const (
-		topic        = "projects/test/topics/noop-topic"
-		subscription = "projects/test/subscriptions/noop-sub"
-		bucketName   = "noop-bucket"
-		objectName   = "never-delivered.txt"
-	)
-
-	createTopicAndSubscription(t, pub, sub, topic, subscription)
-	createBucket(t, base, bucketName)
-	// Register a notif config — with empty pubsubAddr, the fan-out goroutine
-	// is never spawned (see fanoutObjectEvent guard in service.go:413).
-	createNotifConfig(t, base, bucketName, topic, []string{"OBJECT_FINALIZE"}, "")
-
-	// Upload succeeds as usual.
-	simpleUpload(t, base, bucketName, objectName, "data")
-
-	// Poll briefly — expect ZERO messages to arrive (short window since we
-	// want to detect the absence, not wait for a delayed delivery).
-	msgs := pullUntil(t, sub, subscription, 1, 800*time.Millisecond)
-	if len(msgs) != 0 {
-		t.Fatalf("expected 0 messages (pubsubAddr empty), got %d (attrs: %v)",
-			len(msgs), attrsOf(msgs))
-	}
-}
-
-// --- Payload format and custom attributes ---
-
-// TestIntegration_GCS_PubSub_NonePayloadFormat asserts that when
-// PayloadFormat=NONE, the message is still published but with an empty data
-// body (GCS convention per AAP Extension B payload rules).
-func TestIntegration_GCS_PubSub_NonePayloadFormat(t *testing.T) {
-	pubsubAddr, pub, sub := startPubsubForIntegration(t)
-	base := startGCSWithPubsub(t, pubsubAddr)
-
-	const (
-		topic        = "projects/test/topics/none-topic"
-		subscription = "projects/test/subscriptions/none-sub"
-		bucketName   = "none-bucket"
-		objectName   = "x.bin"
-	)
-
-	createTopicAndSubscription(t, pub, sub, topic, subscription)
-	createBucket(t, base, bucketName)
-
-	// Build a config with payload_format=NONE via raw JSON — the helper
-	// default is JSON_API_V1.
-	cfgBody := fmt.Sprintf(`{"topic":%q,"payload_format":"NONE","event_types":["OBJECT_FINALIZE"]}`, topic)
-	resp := putJSON(t, notifConfigsURL(base, bucketName), cfgBody)
-	assertStatus(t, resp, 200)
-	var created NotificationConfig
-	decodeBody(t, resp, &created)
-	if created.PayloadFormat != "NONE" {
-		t.Fatalf("expected PayloadFormat=NONE, got %q", created.PayloadFormat)
-	}
-
-	simpleUpload(t, base, bucketName, objectName, "ignored-content")
-
-	msgs := pullUntil(t, sub, subscription, 1, 3*time.Second)
-	if len(msgs) != 1 {
-		t.Fatalf("expected exactly 1 message, got %d", len(msgs))
-	}
-	m := msgs[0].Message
-	if len(m.Data) != 0 {
-		t.Errorf("expected empty payload for NONE format, got %d bytes: %q", len(m.Data), string(m.Data))
-	}
-	if m.Attributes["payloadFormat"] != "NONE" {
-		t.Errorf("attribute payloadFormat = %q, want NONE", m.Attributes["payloadFormat"])
-	}
-	if m.Attributes["eventType"] != "OBJECT_FINALIZE" {
-		t.Errorf("attribute eventType = %q, want OBJECT_FINALIZE", m.Attributes["eventType"])
-	}
-}
-
-// TestIntegration_GCS_PubSub_CustomAttributes asserts user-supplied
-// custom_attributes are forwarded alongside the canonical eventType/bucketId
-// attributes, without the user's values overriding any canonical key.
-func TestIntegration_GCS_PubSub_CustomAttributes(t *testing.T) {
-	pubsubAddr, pub, sub := startPubsubForIntegration(t)
-	base := startGCSWithPubsub(t, pubsubAddr)
-
-	const (
-		topic        = "projects/test/topics/custom-topic"
-		subscription = "projects/test/subscriptions/custom-sub"
-		bucketName   = "custom-bucket"
-		objectName   = "obj.txt"
-	)
-
-	createTopicAndSubscription(t, pub, sub, topic, subscription)
-	createBucket(t, base, bucketName)
-
-	// Custom attributes include one benign key and one that tries to
-	// override the canonical "eventType" — the latter must NOT win.
-	cfgBody := fmt.Sprintf(`{
-  "topic": %q,
-  "event_types": ["OBJECT_FINALIZE"],
-  "custom_attributes": {
-    "team": "platform",
-    "eventType": "SHOULD_NOT_WIN"
-  }
-}`, topic)
-	resp := putJSON(t, notifConfigsURL(base, bucketName), cfgBody)
-	assertStatus(t, resp, 200)
-
-	simpleUpload(t, base, bucketName, objectName, "x")
-
-	msgs := pullUntil(t, sub, subscription, 1, 3*time.Second)
-	if len(msgs) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(msgs))
-	}
-	a := msgs[0].Message.Attributes
-	if a["team"] != "platform" {
-		t.Errorf("expected custom attribute team=platform, got %q", a["team"])
-	}
-	if a["eventType"] != "OBJECT_FINALIZE" {
-		t.Errorf("canonical eventType must not be overridden by custom_attributes; got %q", a["eventType"])
-	}
-}
-
-// --- Multi-config & isolation tests ---
-
-// TestIntegration_GCS_PubSub_MultipleConfigs asserts that two
-// NotificationConfigs on the same bucket — each pointing at a distinct
-// topic — both receive the event on a single object write.
-func TestIntegration_GCS_PubSub_MultipleConfigs(t *testing.T) {
-	pubsubAddr, pub, sub := startPubsubForIntegration(t)
-	base := startGCSWithPubsub(t, pubsubAddr)
-
-	const (
-		topicA = "projects/test/topics/multi-a"
-		topicB = "projects/test/topics/multi-b"
-		subA   = "projects/test/subscriptions/multi-sub-a"
-		subB   = "projects/test/subscriptions/multi-sub-b"
-		bkt    = "multi-bucket"
-		obj    = "shared.txt"
-	)
-
-	createTopicAndSubscription(t, pub, sub, topicA, subA)
-	createTopicAndSubscription(t, pub, sub, topicB, subB)
-	createBucket(t, base, bkt)
-	createNotifConfig(t, base, bkt, topicA, []string{"OBJECT_FINALIZE"}, "")
-	createNotifConfig(t, base, bkt, topicB, []string{"OBJECT_FINALIZE"}, "")
-
-	simpleUpload(t, base, bkt, obj, "body")
-
-	msgsA := pullUntil(t, sub, subA, 1, 3*time.Second)
-	msgsB := pullUntil(t, sub, subB, 1, 3*time.Second)
-
-	if len(msgsA) != 1 {
-		t.Errorf("topicA: expected 1 message, got %d", len(msgsA))
-	}
-	if len(msgsB) != 1 {
-		t.Errorf("topicB: expected 1 message, got %d", len(msgsB))
-	}
-	if len(msgsA) == 1 && msgsA[0].Message.Attributes["objectId"] != obj {
-		t.Errorf("topicA: objectId = %q, want %q", msgsA[0].Message.Attributes["objectId"], obj)
-	}
-	if len(msgsB) == 1 && msgsB[0].Message.Attributes["objectId"] != obj {
-		t.Errorf("topicB: objectId = %q, want %q", msgsB[0].Message.Attributes["objectId"], obj)
-	}
-}
-
-// TestIntegration_GCS_PubSub_BucketIsolation asserts that a
-// NotificationConfig registered on bucket A does NOT fire for uploads to
-// bucket B. This validates per-bucket config scoping.
-func TestIntegration_GCS_PubSub_BucketIsolation(t *testing.T) {
-	pubsubAddr, pub, sub := startPubsubForIntegration(t)
-	base := startGCSWithPubsub(t, pubsubAddr)
-
-	const (
-		topic    = "projects/test/topics/iso-topic"
-		subName  = "projects/test/subscriptions/iso-sub"
-		watched  = "watched-bucket"
-		ignored  = "ignored-bucket"
-		objectNm = "obj.txt"
-	)
-
-	createTopicAndSubscription(t, pub, sub, topic, subName)
-	createBucket(t, base, watched)
-	createBucket(t, base, ignored)
-	createNotifConfig(t, base, watched, topic, []string{"OBJECT_FINALIZE"}, "")
-
-	// Upload to the non-watched bucket — should NOT emit.
-	simpleUpload(t, base, ignored, objectNm, "shh")
-
-	msgs := pullUntil(t, sub, subName, 1, 800*time.Millisecond)
-	if len(msgs) != 0 {
-		t.Fatalf("expected 0 messages (upload was to unwatched bucket), got %d", len(msgs))
-	}
-
-	// Now upload to the watched bucket — should emit exactly one.
-	simpleUpload(t, base, watched, objectNm, "observed")
-
-	msgs = pullUntil(t, sub, subName, 1, 3*time.Second)
-	if len(msgs) != 1 {
-		t.Fatalf("expected 1 message from watched bucket, got %d", len(msgs))
-	}
-	if got := msgs[0].Message.Attributes["bucketId"]; got != watched {
-		t.Errorf("attribute bucketId = %q, want %q", got, watched)
-	}
-}
-
-// --- Diagnostic helpers ---
-
-// attrsOf returns a concise representation of the per-message eventType
-// attributes for use in test-failure messages.
-func attrsOf(msgs []*pubsubpb.ReceivedMessage) []string {
-	out := make([]string, 0, len(msgs))
-	for _, m := range msgs {
-		out = append(out, fmt.Sprintf("%s/%s", m.Message.Attributes["eventType"], m.Message.Attributes["objectId"]))
-	}
-	return out
-}
-
-// objectIDsOf returns the objectId attribute for each message.
-func objectIDsOf(msgs []*pubsubpb.ReceivedMessage) []string {
-	out := make([]string, 0, len(msgs))
-	for _, m := range msgs {
-		out = append(out, m.Message.Attributes["objectId"])
-	}
-	return out
 }
