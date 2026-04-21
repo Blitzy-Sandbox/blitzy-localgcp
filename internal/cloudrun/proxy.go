@@ -40,7 +40,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -325,26 +324,27 @@ func (p *serviceProxy) boot(ctx context.Context) error {
 // prefixing with "localgcp-cr-" for predictable cleanup by
 // orchestrator.CleanupOrphans.
 func (p *serviceProxy) containerName() string {
-	var b strings.Builder
-	b.Grow(len(p.name) + 16)
-	b.WriteString("localgcp-cr-")
+	const prefix = "localgcp-cr-"
+	buf := make([]byte, 0, len(p.name)+len(prefix))
+	buf = append(buf, prefix...)
 	for _, r := range p.name {
 		switch {
 		case r >= 'a' && r <= 'z',
 			r >= 'A' && r <= 'Z',
 			r >= '0' && r <= '9',
 			r == '-', r == '_':
-			b.WriteRune(r)
+			// All legal cases are ASCII (single-byte) so the
+			// truncation from rune to byte is safe.
+			buf = append(buf, byte(r))
 		default:
-			b.WriteByte('-')
+			buf = append(buf, '-')
 		}
 	}
 	// Trim trailing separators to avoid e.g. "localgcp-cr-foo-".
-	out := b.String()
-	for strings.HasSuffix(out, "-") && len(out) > len("localgcp-cr-") {
-		out = out[:len(out)-1]
+	for len(buf) > len(prefix) && buf[len(buf)-1] == '-' {
+		buf = buf[:len(buf)-1]
 	}
-	return out
+	return string(buf)
 }
 
 // waitForPort polls the given TCP address until it accepts a
