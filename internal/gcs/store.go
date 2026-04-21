@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -356,6 +357,14 @@ func (s *Store) PutObject(bucket, name, contentType string, content []byte) (*Ob
 		Md5Hash:     base64.StdEncoding.EncodeToString(md5sum[:]),
 		Crc32c:      "AAAAAA==",
 		Etag:        hex.EncodeToString(sha256sum[:8]),
+		// SelfLink is the canonical JSON API URL for the object per
+		// the GCS REST schema. It is required by AAP §0.1.1 for the
+		// notification payload to include all 8 canonical fields
+		// {kind, id, selfLink, name, bucket, contentType, timeCreated,
+		// updated}. The path segment is percent-encoded because object
+		// names may contain spaces, slashes, Unicode, and reserved
+		// characters (see TestNotification special-character suite).
+		SelfLink: fmt.Sprintf("https://www.googleapis.com/storage/v1/b/%s/o/%s", bucket, url.PathEscape(name)),
 	}
 
 	s.objects[bucket][name] = &storedObject{Meta: *obj, Content: content}
@@ -423,6 +432,11 @@ func (s *Store) CopyObject(srcBucket, srcName, dstBucket, dstName string) (*Obje
 	obj.Bucket = dstBucket
 	obj.TimeCreated = now
 	obj.Updated = now
+	// Rebuild SelfLink for the destination so the notification payload
+	// emitted by the fan-out path carries the correct canonical URL
+	// (AAP §0.1.1). The source's SelfLink would point at the source
+	// bucket/object, which is incorrect for a copied object.
+	obj.SelfLink = fmt.Sprintf("https://www.googleapis.com/storage/v1/b/%s/o/%s", dstBucket, url.PathEscape(dstName))
 
 	s.objects[dstBucket][dstName] = &storedObject{Meta: obj, Content: content}
 	s.persist()
