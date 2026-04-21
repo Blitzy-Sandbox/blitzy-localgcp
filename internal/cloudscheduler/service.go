@@ -336,8 +336,10 @@ func (s *Service) ResumeJob(_ context.Context, req *schedulerpb.ResumeJobRequest
 func (s *Service) scheduleJob(job *Job) error {
 	spec := job.Schedule
 	if spec == "" {
-		// Cloud Scheduler allows jobs without a schedule (manual-only); we
-		// accept this and simply do not register a tick entry.
+		// Defensive: validateJob rejects empty schedules at the RPC
+		// boundary (see validateJob), so this branch is unreachable via
+		// public APIs. Kept to prevent a panic if an in-process caller
+		// ever installs a Job directly through the store.
 		return nil
 	}
 
@@ -441,18 +443,26 @@ func (s *Service) dispatchPubsub(job *Job, t *schedulerpb.PubsubTarget) {
 
 // validateJob enforces basic structural requirements:
 //
-//   - schedule (if set) must parse as a 5-field standard cron expression,
+//   - schedule must be a non-empty 5-field standard cron expression,
 //   - exactly one of HttpTarget or PubsubTarget must be set,
 //   - AppEngineHttpTarget is explicitly rejected — AAP §0.6.2 lists App
 //     Engine targets as out of scope, so jobs carrying one are refused at
 //     create/update time with codes.InvalidArgument rather than silently
 //     accepted and then never dispatched (which would surface as
 //     per-tick "no recognised target" log spam and confuse SDK users).
+//
+// Schedule is required per AAP §0.5.1.4 TestCreateJobRequiresTargetAndSchedule
+// and matches real Cloud Scheduler API behaviour where the `schedule`
+// field is required on every Job. Earlier revisions of this emulator
+// accepted an empty schedule as "manual-only" (RunJob-only); that
+// allowance was tightened to match both the AAP contract and the public
+// Cloud Scheduler API.
 func validateJob(job *schedulerpb.Job) error {
-	if job.GetSchedule() != "" {
-		if _, err := cron.ParseStandard(job.GetSchedule()); err != nil {
-			return status.Errorf(codes.InvalidArgument, "invalid schedule %q: %v", job.GetSchedule(), err)
-		}
+	if job.GetSchedule() == "" {
+		return status.Error(codes.InvalidArgument, "job.schedule is required")
+	}
+	if _, err := cron.ParseStandard(job.GetSchedule()); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid schedule %q: %v", job.GetSchedule(), err)
 	}
 	if job.GetAppEngineHttpTarget() != nil {
 		return status.Error(codes.InvalidArgument, "localgcp: AppEngineHttpTarget is not supported")

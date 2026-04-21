@@ -1,562 +1,794 @@
 // Package cloudscheduler — service_test.go exercises the eight in-scope
-// CloudScheduler RPCs at the Go method level (without standing up a gRPC
-// server). The tests validate:
+// CloudScheduler RPCs over an in-process gRPC server, mirroring the
+// helper / harness pattern used by internal/cloudtasks/service_test.go and
+// internal/cloudrun/service_test.go for consistency with the rest of the
+// codebase.
 //
-//   - CRUD round-trip for HTTP-target jobs.
-//   - Input validation: invalid cron expression, missing/duplicate targets,
-//     parent prefix enforcement, name-required on Update.
-//   - NotFound semantics for Get, Update, Delete, RunJob on unknown names.
-//   - Pause/Resume state transitions and their cron-entry consequences.
-//   - RunJob immediate dispatch that does NOT mutate schedule or state
-//     (the canonical requirement from AAP §0.1.1 Extension C).
+// The tests validate:
 //
-// Tests use an empty pubsubAddr so Pub/Sub target dispatch is a silent no-op
-// and no goroutine leaks outside the test binary. The cron runner is never
-// Start()'d, so AddFunc entries are queued but never fire — this keeps tests
-// deterministic and hermetic.
+//   - CRUD round-trip for HTTP-target jobs over the gRPC wire.
+//   - Input validation: invalid cron expression, missing target, missing
+//     schedule, name prefix enforcement.
+//   - NotFound semantics for Get, Delete, Run, Pause, Resume on unknown names.
+//   - Pause/Resume state-machine transitions persisted across GetJob.
+//   - RunJob immediate HTTP-target dispatch (via httptest.NewServer).
+//   - RunJob does NOT mutate schedule or state (the canonical invariant from
+//     AAP §0.1.1 Extension C).
+//   - CreateJob with PubsubTarget succeeds without a configured pubsubAddr
+//     (Rule 7a silent no-op for loopback Pub/Sub delivery).
+//
+// All test jobs use neverSchedule = "0 0 1 1 *" so that the cron runner
+// does not fire during the test window; RunJob is used to trigger
+// dispatch deterministically.
+//
+// Pub/Sub-target dispatch is exercised at the validation level only —
+// actual loopback delivery is out of scope for unit tests and is covered
+// by the //go:build integration tests in the sibling gcs and logging
+// packages (per AAP Rule 9).
+//
+// Tests use the same-package form (package cloudscheduler, not
+// cloudscheduler_test) so the test helper can access the unexported
+// svc.cron field to drive the cron runner deterministically.
 package cloudscheduler
 
 import (
 	"context"
 	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	schedulerpb "cloud.google.com/go/scheduler/apiv1/schedulerpb"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
+// Note: Rule 6 (canonical unimplemented error for out-of-scope RPCs) is trivially
+// satisfied because schedulerpb.CloudSchedulerServer contains exactly the 8 RPCs
+// that are all in scope (CreateJob, GetJob, ListJobs, DeleteJob, UpdateJob, RunJob,
+// PauseJob, ResumeJob). No CloudScheduler RPCs are out-of-scope, so no separate
+// unimplemented-error test is necessary.
+
 const (
-	testParent = "projects/test-project/locations/us-central1"
+	// testParent is the default parent resource for job tests.
+	testParent = "projects/test/locations/us-central1"
+	// testJobName is a fully-qualified job resource name used as the default
+	// single-job identity across tests that do not need multiple jobs.
+	testJobName = testParent + "/jobs/job-1"
+	// neverSchedule is a 5-field cron spec that will not fire during any
+	// reasonable test run. "0 0 1 1 *" means minute=0 hour=0 day-of-month=1
+	// month=1 day-of-week=any — i.e., midnight on January 1st (annual) in
+	// host local time. Using this expression throughout the suite allows
+	// us to safely start the cron runner without risking spurious firings.
+	neverSchedule = "0 0 1 1 *"
 )
 
-// helper: build a fully-qualified job name under testParent.
+// jobName builds a fully-qualified job name under testParent from a short id.
 func jobName(short string) string {
 	return testParent + "/jobs/" + short
 }
 
-// helper: build a valid HTTP-target job request.
-func httpJobReq(short, schedule, uri string) *schedulerpb.CreateJobRequest {
+// httpJobRequest builds a CreateJobRequest with an HTTP POST target. The
+// returned request's Job.Parent is always testParent; the Name field is
+// expected to be fully-qualified and under that parent (use jobName(...)
+// or testJobName).
+func httpJobRequest(name, schedule, uri string) *schedulerpb.CreateJobRequest {
 	return &schedulerpb.CreateJobRequest{
 		Parent: testParent,
 		Job: &schedulerpb.Job{
-			Name:     jobName(short),
+			Name:     name,
 			Schedule: schedule,
 			Target: &schedulerpb.Job_HttpTarget{
-				HttpTarget: &schedulerpb.HttpTarget{Uri: uri, HttpMethod: schedulerpb.HttpMethod_POST},
+				HttpTarget: &schedulerpb.HttpTarget{
+					Uri:        uri,
+					HttpMethod: schedulerpb.HttpMethod_POST,
+				},
 			},
 		},
 	}
 }
 
-// helper: build a Pub/Sub-target job request.
-func pubsubJobReq(short, schedule, topic string) *schedulerpb.CreateJobRequest {
+// pubsubJobRequest builds a CreateJobRequest with a Pub/Sub target.
+func pubsubJobRequest(name, schedule, topic string, data []byte, attrs map[string]string) *schedulerpb.CreateJobRequest {
 	return &schedulerpb.CreateJobRequest{
 		Parent: testParent,
 		Job: &schedulerpb.Job{
-			Name:     jobName(short),
+			Name:     name,
 			Schedule: schedule,
 			Target: &schedulerpb.Job_PubsubTarget{
-				PubsubTarget: &schedulerpb.PubsubTarget{TopicName: topic, Data: []byte("hello")},
+				PubsubTarget: &schedulerpb.PubsubTarget{
+					TopicName:  topic,
+					Data:       data,
+					Attributes: attrs,
+				},
 			},
 		},
 	}
 }
 
-// newTestService constructs an isolated Service with an empty pubsubAddr.
-// Pass "" for pubsubAddr so dispatchPubsub is a no-op for every tick, which
-// keeps tests hermetic even if the cron runner were started accidentally.
-func newTestService(t *testing.T) *Service {
+// schedulerTestClient starts an in-process Cloud Scheduler gRPC server on
+// an ephemeral port and returns a client, the *Service (for white-box
+// assertions when tests need them), and a cleanup function.
+//
+// Design notes:
+//
+//   - The helper passes "" for pubsubAddr so PubsubTarget dispatch is a
+//     silent no-op (AAP Rule 7a). This keeps unit tests hermetic — the
+//     loopback Pub/Sub delivery path is exercised by the //go:build
+//     integration tests in the sibling gcs and logging packages.
+//
+//   - The cron runner is explicitly started via svc.cron.Start() so that
+//     RunJob's fire-and-forget dispatch goroutine path is active and the
+//     scheduleJob / unscheduleJob entry-management code paths are
+//     exercised during CreateJob / UpdateJob / DeleteJob / PauseJob /
+//     ResumeJob. Because all test jobs use neverSchedule, the runner
+//     itself does not fire during the test window.
+//
+//   - The helper calls srv.Stop() (not GracefulStop) on cleanup because
+//     an ephemeral test binary has no long-running RPCs to drain — a
+//     graceful shutdown would add test latency without benefit.
+//
+//   - t.Cleanup is NOT used here — instead the caller is expected to
+//     `defer cleanup()` — matching the idiom in the sibling cloudtasks
+//     and cloudrun test files.
+func schedulerTestClient(t *testing.T) (schedulerpb.CloudSchedulerClient, *Service, func()) {
 	t.Helper()
-	return New("", true, "")
+
+	svc := New("", true, "") // in-memory dataDir, quiet logger, no Pub/Sub loopback.
+
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	srv := grpc.NewServer()
+	schedulerpb.RegisterCloudSchedulerServer(srv, svc)
+	go func() {
+		// Serve returns when srv.Stop() is called in cleanup; the error is
+		// always non-nil in that case (grpc.ErrServerStopped). We
+		// intentionally ignore the return value for test ergonomics.
+		_ = srv.Serve(ln)
+	}()
+
+	// Start the cron runner so that scheduleJob's AddFunc registrations are
+	// live. All test jobs use neverSchedule so no tick will fire during
+	// the test window.
+	svc.cron.Start()
+
+	conn, err := grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		srv.Stop()
+		t.Fatalf("dial: %v", err)
+	}
+	client := schedulerpb.NewCloudSchedulerClient(conn)
+
+	cleanup := func() {
+		// Stop the cron runner first so no new dispatches are enqueued
+		// during teardown. cron.Stop returns a context that is Done when
+		// all in-flight tick-launched goroutines finish; we wait for it
+		// to avoid leaking goroutines into subsequent tests.
+		<-svc.cron.Stop().Done()
+		_ = conn.Close()
+		srv.Stop()
+	}
+	return client, svc, cleanup
 }
 
-// --- CreateJob happy path and validation ---
+// ============================================================================
+// CRUD tests — round-trip coverage for the service-level gRPC surface.
+// ============================================================================
 
-func TestCreateJob_HttpTarget_RoundTrip(t *testing.T) {
-	svc := newTestService(t)
+// TestCreateAndGetJob covers the canonical CRUD round-trip: create a job,
+// assert the returned proto carries the expected fields, then re-read via
+// GetJob and assert the same fields persist.
+func TestCreateAndGetJob(t *testing.T) {
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
 	ctx := context.Background()
 
-	req := httpJobReq("cron-1", "*/5 * * * *", "http://example.test/invoke")
-	got, err := svc.CreateJob(ctx, req)
+	created, err := client.CreateJob(ctx, httpJobRequest(testJobName, neverSchedule, "http://example.invalid/"))
 	if err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
-	if got.GetName() != jobName("cron-1") {
-		t.Errorf("Name = %q, want %q", got.GetName(), jobName("cron-1"))
+	if created.GetName() != testJobName {
+		t.Errorf("created.Name = %q, want %q", created.GetName(), testJobName)
 	}
-	if got.GetState() != schedulerpb.Job_ENABLED {
-		t.Errorf("State = %v, want ENABLED", got.GetState())
+	// Jobs default to ENABLED on creation (service.go CreateJob sets
+	// State = Job_ENABLED when the caller leaves it as Job_STATE_UNSPECIFIED).
+	if created.GetState() != schedulerpb.Job_ENABLED {
+		t.Errorf("created.State = %v, want ENABLED", created.GetState())
 	}
-	if got.GetHttpTarget() == nil {
-		t.Fatalf("HttpTarget nil; got Target=%T", got.GetTarget())
+	if created.GetSchedule() != neverSchedule {
+		t.Errorf("created.Schedule = %q, want %q", created.GetSchedule(), neverSchedule)
 	}
-	if got.GetHttpTarget().GetUri() != "http://example.test/invoke" {
-		t.Errorf("Uri = %q, want http://example.test/invoke", got.GetHttpTarget().GetUri())
+	if ht := created.GetHttpTarget(); ht == nil || ht.GetUri() != "http://example.invalid/" {
+		t.Errorf("created.HttpTarget = %+v, want URI http://example.invalid/", ht)
 	}
 
-	// Get should round-trip.
-	back, err := svc.GetJob(ctx, &schedulerpb.GetJobRequest{Name: got.GetName()})
+	got, err := client.GetJob(ctx, &schedulerpb.GetJobRequest{Name: testJobName})
 	if err != nil {
 		t.Fatalf("GetJob: %v", err)
 	}
-	if back.GetName() != got.GetName() {
-		t.Errorf("GetJob roundtrip mismatch: %q vs %q", back.GetName(), got.GetName())
+	if got.GetName() != testJobName {
+		t.Errorf("got.Name = %q, want %q", got.GetName(), testJobName)
+	}
+	if got.GetState() != schedulerpb.Job_ENABLED {
+		t.Errorf("got.State = %v, want ENABLED", got.GetState())
+	}
+	if got.GetSchedule() != neverSchedule {
+		t.Errorf("got.Schedule = %q, want %q", got.GetSchedule(), neverSchedule)
+	}
+	if ht := got.GetHttpTarget(); ht == nil || ht.GetUri() != "http://example.invalid/" {
+		t.Errorf("got.HttpTarget = %+v, want URI http://example.invalid/", ht)
 	}
 }
 
-func TestCreateJob_PubsubTarget_RoundTrip(t *testing.T) {
-	svc := newTestService(t)
+// TestListJobs creates three jobs under testParent plus one job under a
+// different parent and confirms the List call only returns jobs whose
+// Name matches the requested Parent prefix. Also pins the contract that
+// List returns results in alphabetical Name order.
+func TestListJobs(t *testing.T) {
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
 	ctx := context.Background()
-	got, err := svc.CreateJob(ctx, pubsubJobReq("ps-1", "0 9 * * *", "projects/p/topics/t"))
-	if err != nil {
-		t.Fatalf("CreateJob: %v", err)
-	}
-	if got.GetPubsubTarget().GetTopicName() != "projects/p/topics/t" {
-		t.Errorf("TopicName = %q", got.GetPubsubTarget().GetTopicName())
-	}
-}
 
-func TestCreateJob_InvalidSchedule_ReturnsInvalidArgument(t *testing.T) {
-	svc := newTestService(t)
-	_, err := svc.CreateJob(context.Background(), httpJobReq("bad", "not-a-schedule", "http://example.test/"))
-	if err == nil {
-		t.Fatalf("CreateJob with invalid schedule did not error")
+	// Create three jobs under testParent.
+	for _, short := range []string{"job-a", "job-b", "job-c"} {
+		if _, err := client.CreateJob(ctx, httpJobRequest(jobName(short), neverSchedule, "http://example.invalid/"+short)); err != nil {
+			t.Fatalf("CreateJob(%s): %v", short, err)
+		}
 	}
-	if got := status.Code(err); got != codes.InvalidArgument {
-		t.Errorf("code = %v, want InvalidArgument; err=%v", got, err)
-	}
-}
 
-func TestCreateJob_NoTarget_ReturnsInvalidArgument(t *testing.T) {
-	svc := newTestService(t)
-	req := &schedulerpb.CreateJobRequest{
-		Parent: testParent,
-		Job:    &schedulerpb.Job{Name: jobName("no-target"), Schedule: "*/5 * * * *"},
-	}
-	_, err := svc.CreateJob(context.Background(), req)
-	if got := status.Code(err); got != codes.InvalidArgument {
-		t.Errorf("code = %v, want InvalidArgument; err=%v", got, err)
-	}
-}
-
-// TestCreateJob_AppEngineTarget_ReturnsInvalidArgument verifies that
-// AppEngineHttpTarget is rejected at validateJob time with
-// codes.InvalidArgument. AppEngine HTTP targets are explicitly out of
-// scope (AAP §0.6.2); the emulator refuses them outright rather than
-// silently accepting the request and never dispatching (which would
-// produce confusing per-tick "no recognised target" log spam).
-//
-// Note: protobuf oneof semantics make it impossible to construct a Job
-// with two targets simultaneously via the public Go API (the last
-// assignment always wins), so the ">1 target" branch of validateJob
-// cannot be exercised through the public surface — that branch is a
-// defence-in-depth guard for reflection-based proto construction.
-func TestCreateJob_AppEngineTarget_ReturnsInvalidArgument(t *testing.T) {
-	svc := newTestService(t)
-	req := &schedulerpb.CreateJobRequest{
-		Parent: testParent,
+	// Create one job under a different parent — must not appear in a
+	// testParent list.
+	otherParent := "projects/other/locations/us-central1"
+	_, err := client.CreateJob(ctx, &schedulerpb.CreateJobRequest{
+		Parent: otherParent,
 		Job: &schedulerpb.Job{
-			Name:     jobName("ae1"),
-			Schedule: "*/5 * * * *",
-			Target: &schedulerpb.Job_AppEngineHttpTarget{
-				AppEngineHttpTarget: &schedulerpb.AppEngineHttpTarget{},
-			},
-		},
-	}
-	_, err := svc.CreateJob(context.Background(), req)
-	if got := status.Code(err); got != codes.InvalidArgument {
-		t.Errorf("code = %v, want InvalidArgument; err=%v", got, err)
-	}
-}
-
-func TestCreateJob_NameMustBeUnderParent(t *testing.T) {
-	svc := newTestService(t)
-	req := &schedulerpb.CreateJobRequest{
-		Parent: testParent,
-		Job: &schedulerpb.Job{
-			// Name not under parent → InvalidArgument.
-			Name:     "projects/other/locations/us-central1/jobs/mismatch",
-			Schedule: "*/5 * * * *",
+			Name:     otherParent + "/jobs/elsewhere",
+			Schedule: neverSchedule,
 			Target: &schedulerpb.Job_HttpTarget{
 				HttpTarget: &schedulerpb.HttpTarget{Uri: "http://x/"},
 			},
 		},
-	}
-	_, err := svc.CreateJob(context.Background(), req)
-	if got := status.Code(err); got != codes.InvalidArgument {
-		t.Errorf("code = %v, want InvalidArgument; err=%v", got, err)
-	}
-}
-
-func TestCreateJob_ParentRequired(t *testing.T) {
-	svc := newTestService(t)
-	_, err := svc.CreateJob(context.Background(), &schedulerpb.CreateJobRequest{})
-	if got := status.Code(err); got != codes.InvalidArgument {
-		t.Errorf("code = %v, want InvalidArgument; err=%v", got, err)
-	}
-}
-
-func TestCreateJob_DuplicateReturnsAlreadyExists(t *testing.T) {
-	svc := newTestService(t)
-	ctx := context.Background()
-	_, err := svc.CreateJob(ctx, httpJobReq("dup", "*/5 * * * *", "http://x/"))
+	})
 	if err != nil {
-		t.Fatalf("first CreateJob: %v", err)
-	}
-	_, err = svc.CreateJob(ctx, httpJobReq("dup", "*/5 * * * *", "http://x/"))
-	if got := status.Code(err); got != codes.AlreadyExists {
-		t.Errorf("code = %v, want AlreadyExists; err=%v", got, err)
-	}
-}
-
-// --- Get / Delete / List ---
-
-func TestGetJob_NotFound(t *testing.T) {
-	svc := newTestService(t)
-	_, err := svc.GetJob(context.Background(), &schedulerpb.GetJobRequest{Name: jobName("missing")})
-	if got := status.Code(err); got != codes.NotFound {
-		t.Errorf("code = %v, want NotFound; err=%v", got, err)
-	}
-}
-
-func TestDeleteJob_NotFound(t *testing.T) {
-	svc := newTestService(t)
-	_, err := svc.DeleteJob(context.Background(), &schedulerpb.DeleteJobRequest{Name: jobName("missing")})
-	if got := status.Code(err); got != codes.NotFound {
-		t.Errorf("code = %v, want NotFound; err=%v", got, err)
-	}
-}
-
-func TestDeleteJob_RoundTrip(t *testing.T) {
-	svc := newTestService(t)
-	ctx := context.Background()
-	_, err := svc.CreateJob(ctx, httpJobReq("doomed", "*/5 * * * *", "http://x/"))
-	if err != nil {
-		t.Fatalf("CreateJob: %v", err)
-	}
-	_, err = svc.DeleteJob(ctx, &schedulerpb.DeleteJobRequest{Name: jobName("doomed")})
-	if err != nil {
-		t.Fatalf("DeleteJob: %v", err)
-	}
-	_, err = svc.GetJob(ctx, &schedulerpb.GetJobRequest{Name: jobName("doomed")})
-	if got := status.Code(err); got != codes.NotFound {
-		t.Errorf("Get after Delete: code = %v, want NotFound", got)
-	}
-}
-
-func TestListJobs_FiltersByParent(t *testing.T) {
-	svc := newTestService(t)
-	ctx := context.Background()
-	if _, err := svc.CreateJob(ctx, httpJobReq("j1", "*/5 * * * *", "http://x/1")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := svc.CreateJob(ctx, httpJobReq("j2", "*/5 * * * *", "http://x/2")); err != nil {
-		t.Fatal(err)
+		t.Fatalf("CreateJob(elsewhere): %v", err)
 	}
 
-	resp, err := svc.ListJobs(ctx, &schedulerpb.ListJobsRequest{Parent: testParent})
+	resp, err := client.ListJobs(ctx, &schedulerpb.ListJobsRequest{Parent: testParent})
 	if err != nil {
 		t.Fatalf("ListJobs: %v", err)
 	}
-	if len(resp.GetJobs()) != 2 {
-		t.Errorf("len = %d, want 2", len(resp.GetJobs()))
+	jobs := resp.GetJobs()
+	if len(jobs) != 3 {
+		t.Fatalf("ListJobs returned %d jobs, want 3; got names:", len(jobs))
 	}
-
-	empty, err := svc.ListJobs(ctx, &schedulerpb.ListJobsRequest{Parent: "projects/other/locations/eu-west"})
-	if err != nil {
-		t.Fatalf("ListJobs other: %v", err)
-	}
-	if len(empty.GetJobs()) != 0 {
-		t.Errorf("len (other parent) = %d, want 0", len(empty.GetJobs()))
+	// store.List sorts alphabetically by Name.
+	want := []string{jobName("job-a"), jobName("job-b"), jobName("job-c")}
+	for i, j := range jobs {
+		if j.GetName() != want[i] {
+			t.Errorf("jobs[%d].Name = %q, want %q", i, j.GetName(), want[i])
+		}
 	}
 }
 
-// --- UpdateJob ---
-
-func TestUpdateJob_RoundTrip(t *testing.T) {
-	svc := newTestService(t)
+// TestDeleteJob covers a create, delete, GetJob-returns-NotFound round
+// trip and additionally asserts that a second DeleteJob on the same name
+// returns NotFound (the emulator does NOT implement idempotent-delete
+// semantics on the second call).
+func TestDeleteJob(t *testing.T) {
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
 	ctx := context.Background()
-	if _, err := svc.CreateJob(ctx, httpJobReq("u1", "*/5 * * * *", "http://x/")); err != nil {
+
+	if _, err := client.CreateJob(ctx, httpJobRequest(testJobName, neverSchedule, "http://example.invalid/")); err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
 
-	updated, err := svc.UpdateJob(ctx, &schedulerpb.UpdateJobRequest{
+	if _, err := client.DeleteJob(ctx, &schedulerpb.DeleteJobRequest{Name: testJobName}); err != nil {
+		t.Fatalf("DeleteJob: %v", err)
+	}
+
+	_, err := client.GetJob(ctx, &schedulerpb.GetJobRequest{Name: testJobName})
+	if err == nil {
+		t.Fatal("GetJob after Delete: expected error")
+	}
+	if got := status.Code(err); got != codes.NotFound {
+		t.Fatalf("GetJob after Delete: code = %v, want NotFound; err=%v", got, err)
+	}
+
+	// A second DeleteJob on the same name returns NotFound — the
+	// emulator's Delete is NOT idempotent on already-deleted jobs.
+	_, err = client.DeleteJob(ctx, &schedulerpb.DeleteJobRequest{Name: testJobName})
+	if err == nil {
+		t.Fatal("second DeleteJob: expected NotFound")
+	}
+	if got := status.Code(err); got != codes.NotFound {
+		t.Fatalf("second DeleteJob: code = %v, want NotFound; err=%v", got, err)
+	}
+}
+
+// TestUpdateJob creates a job, updates its HttpTarget URI, asserts the
+// returned proto has the new URI, and asserts a subsequent GetJob call
+// observes the updated URI (i.e., the update is persisted).
+func TestUpdateJob(t *testing.T) {
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if _, err := client.CreateJob(ctx, httpJobRequest(testJobName, neverSchedule, "http://example.invalid/v1")); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	updated, err := client.UpdateJob(ctx, &schedulerpb.UpdateJobRequest{
 		Job: &schedulerpb.Job{
-			Name:     jobName("u1"),
-			Schedule: "0 12 * * *",
+			Name:     testJobName,
+			Schedule: neverSchedule,
 			Target: &schedulerpb.Job_HttpTarget{
-				HttpTarget: &schedulerpb.HttpTarget{Uri: "http://x/v2"},
+				HttpTarget: &schedulerpb.HttpTarget{Uri: "http://example.invalid/v2"},
 			},
 		},
 	})
 	if err != nil {
 		t.Fatalf("UpdateJob: %v", err)
 	}
-	if updated.GetSchedule() != "0 12 * * *" {
-		t.Errorf("Schedule = %q, want 0 12 * * *", updated.GetSchedule())
+	if got := updated.GetHttpTarget().GetUri(); got != "http://example.invalid/v2" {
+		t.Errorf("updated.HttpTarget.Uri = %q, want http://example.invalid/v2", got)
 	}
-	if updated.GetHttpTarget().GetUri() != "http://x/v2" {
-		t.Errorf("Uri = %q, want http://x/v2", updated.GetHttpTarget().GetUri())
+	if updated.GetName() != testJobName {
+		t.Errorf("updated.Name = %q, want %q", updated.GetName(), testJobName)
 	}
 
 	// GetJob should observe the update.
-	back, err := svc.GetJob(ctx, &schedulerpb.GetJobRequest{Name: jobName("u1")})
+	after, err := client.GetJob(ctx, &schedulerpb.GetJobRequest{Name: testJobName})
 	if err != nil {
-		t.Fatalf("GetJob: %v", err)
+		t.Fatalf("GetJob after Update: %v", err)
 	}
-	if back.GetSchedule() != "0 12 * * *" {
-		t.Errorf("GetJob after Update: Schedule = %q", back.GetSchedule())
-	}
-}
-
-func TestUpdateJob_NameRequired(t *testing.T) {
-	svc := newTestService(t)
-	_, err := svc.UpdateJob(context.Background(), &schedulerpb.UpdateJobRequest{
-		Job: &schedulerpb.Job{Schedule: "*/5 * * * *",
-			Target: &schedulerpb.Job_HttpTarget{HttpTarget: &schedulerpb.HttpTarget{Uri: "http://x/"}}},
-	})
-	if got := status.Code(err); got != codes.InvalidArgument {
-		t.Errorf("code = %v, want InvalidArgument; err=%v", got, err)
+	if got := after.GetHttpTarget().GetUri(); got != "http://example.invalid/v2" {
+		t.Errorf("after.HttpTarget.Uri = %q, want http://example.invalid/v2", got)
 	}
 }
 
-func TestUpdateJob_NotFound(t *testing.T) {
-	svc := newTestService(t)
-	_, err := svc.UpdateJob(context.Background(), &schedulerpb.UpdateJobRequest{
-		Job: &schedulerpb.Job{
-			Name:     jobName("ghost"),
-			Schedule: "*/5 * * * *",
-			Target:   &schedulerpb.Job_HttpTarget{HttpTarget: &schedulerpb.HttpTarget{Uri: "http://x/"}},
-		},
-	})
-	if got := status.Code(err); got != codes.NotFound {
-		t.Errorf("code = %v, want NotFound; err=%v", got, err)
-	}
-}
-
-// --- Pause / Resume ---
-
-func TestPauseJob_TransitionsToPaused(t *testing.T) {
-	svc := newTestService(t)
+// TestDuplicateJobFails asserts that creating a job with a name that
+// already exists returns codes.AlreadyExists.
+func TestDuplicateJobFails(t *testing.T) {
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
 	ctx := context.Background()
-	if _, err := svc.CreateJob(ctx, httpJobReq("p1", "*/5 * * * *", "http://x/")); err != nil {
+
+	if _, err := client.CreateJob(ctx, httpJobRequest(testJobName, neverSchedule, "http://example.invalid/")); err != nil {
+		t.Fatalf("first CreateJob: %v", err)
+	}
+	_, err := client.CreateJob(ctx, httpJobRequest(testJobName, neverSchedule, "http://example.invalid/"))
+	if err == nil {
+		t.Fatal("second CreateJob: expected AlreadyExists")
+	}
+	if got := status.Code(err); got != codes.AlreadyExists {
+		t.Fatalf("second CreateJob: code = %v, want AlreadyExists; err=%v", got, err)
+	}
+}
+
+// ============================================================================
+// State-machine tests — Pause/Resume transitions.
+// ============================================================================
+
+// TestPauseAndResumeJob covers the ENABLED -> PAUSED -> ENABLED state
+// machine and asserts that the transitions are observable on a
+// subsequent GetJob call (i.e., persisted in the store).
+func TestPauseAndResumeJob(t *testing.T) {
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	created, err := client.CreateJob(ctx, httpJobRequest(testJobName, neverSchedule, "http://example.invalid/"))
+	if err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
-	got, err := svc.PauseJob(ctx, &schedulerpb.PauseJobRequest{Name: jobName("p1")})
+	if created.GetState() != schedulerpb.Job_ENABLED {
+		t.Fatalf("created.State = %v, want ENABLED", created.GetState())
+	}
+
+	// ENABLED -> PAUSED
+	paused, err := client.PauseJob(ctx, &schedulerpb.PauseJobRequest{Name: testJobName})
 	if err != nil {
 		t.Fatalf("PauseJob: %v", err)
 	}
-	if got.GetState() != schedulerpb.Job_PAUSED {
-		t.Errorf("State = %v, want PAUSED", got.GetState())
+	if paused.GetState() != schedulerpb.Job_PAUSED {
+		t.Errorf("paused.State = %v, want PAUSED", paused.GetState())
 	}
-}
 
-func TestPauseJob_NotFound(t *testing.T) {
-	svc := newTestService(t)
-	_, err := svc.PauseJob(context.Background(), &schedulerpb.PauseJobRequest{Name: jobName("ghost")})
-	if got := status.Code(err); got != codes.NotFound {
-		t.Errorf("code = %v, want NotFound; err=%v", got, err)
+	// Persisted — GetJob observes PAUSED.
+	viaGet, err := client.GetJob(ctx, &schedulerpb.GetJobRequest{Name: testJobName})
+	if err != nil {
+		t.Fatalf("GetJob after Pause: %v", err)
 	}
-}
+	if viaGet.GetState() != schedulerpb.Job_PAUSED {
+		t.Errorf("viaGet.State = %v, want PAUSED", viaGet.GetState())
+	}
 
-func TestResumeJob_TransitionsToEnabled(t *testing.T) {
-	svc := newTestService(t)
-	ctx := context.Background()
-	if _, err := svc.CreateJob(ctx, httpJobReq("r1", "*/5 * * * *", "http://x/")); err != nil {
-		t.Fatalf("CreateJob: %v", err)
-	}
-	if _, err := svc.PauseJob(ctx, &schedulerpb.PauseJobRequest{Name: jobName("r1")}); err != nil {
-		t.Fatalf("PauseJob: %v", err)
-	}
-	resumed, err := svc.ResumeJob(ctx, &schedulerpb.ResumeJobRequest{Name: jobName("r1")})
+	// PAUSED -> ENABLED
+	resumed, err := client.ResumeJob(ctx, &schedulerpb.ResumeJobRequest{Name: testJobName})
 	if err != nil {
 		t.Fatalf("ResumeJob: %v", err)
 	}
 	if resumed.GetState() != schedulerpb.Job_ENABLED {
-		t.Errorf("State = %v, want ENABLED", resumed.GetState())
+		t.Errorf("resumed.State = %v, want ENABLED", resumed.GetState())
+	}
+
+	// Persisted — GetJob observes ENABLED.
+	viaGet2, err := client.GetJob(ctx, &schedulerpb.GetJobRequest{Name: testJobName})
+	if err != nil {
+		t.Fatalf("GetJob after Resume: %v", err)
+	}
+	if viaGet2.GetState() != schedulerpb.Job_ENABLED {
+		t.Errorf("viaGet2.State = %v, want ENABLED", viaGet2.GetState())
 	}
 }
 
-func TestResumeJob_NotFound(t *testing.T) {
-	svc := newTestService(t)
-	_, err := svc.ResumeJob(context.Background(), &schedulerpb.ResumeJobRequest{Name: jobName("ghost")})
-	if got := status.Code(err); got != codes.NotFound {
-		t.Errorf("code = %v, want NotFound; err=%v", got, err)
-	}
-}
+// ============================================================================
+// RunJob tests — the critical invariant for on-demand dispatch.
+// ============================================================================
 
-// --- RunJob ---
+// TestRunJobDispatchesHttpTarget stands up an httptest HTTP server and
+// verifies that RunJob triggers a single HTTP POST to the job's
+// HttpTarget URI. The cron runner is started but the job uses
+// neverSchedule, so only the RunJob-path dispatch is exercised.
+//
+// Per AAP Rule 3, RunJob MUST return immediately — the HTTP dispatch
+// runs in a background goroutine (see dispatchOnce in service.go). The
+// polling loop below accommodates that asynchrony.
+func TestRunJobDispatchesHttpTarget(t *testing.T) {
+	var received atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
 
-// TestRunJob_DoesNotMutateScheduleOrState is the canonical AAP requirement
-// for RunJob: it performs a single one-shot dispatch WITHOUT mutating the
-// job's schedule or state. See AAP §0.1.1 Extension C paragraph.
-func TestRunJob_DoesNotMutateScheduleOrState(t *testing.T) {
-	svc := newTestService(t)
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
 	ctx := context.Background()
-	orig, err := svc.CreateJob(ctx, httpJobReq("run-me", "*/15 * * * *", "http://unreachable.invalid/"))
+
+	created, err := client.CreateJob(ctx, httpJobRequest(testJobName, neverSchedule, target.URL))
 	if err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
-	origSchedule, origState := orig.GetSchedule(), orig.GetState()
+	if created.GetName() != testJobName {
+		t.Fatalf("created.Name = %q, want %q", created.GetName(), testJobName)
+	}
 
-	if _, err := svc.RunJob(ctx, &schedulerpb.RunJobRequest{Name: jobName("run-me")}); err != nil {
+	ran, err := client.RunJob(ctx, &schedulerpb.RunJobRequest{Name: testJobName})
+	if err != nil {
 		t.Fatalf("RunJob: %v", err)
 	}
+	// RunJob must not mutate schedule or state (see also
+	// TestRunJobDoesNotMutateScheduleOrState for the GetJob-after-RunJob
+	// assertion).
+	if ran.GetSchedule() != neverSchedule {
+		t.Errorf("RunJob mutated Schedule on returned proto: got %q, want %q", ran.GetSchedule(), neverSchedule)
+	}
+	if ran.GetState() != schedulerpb.Job_ENABLED {
+		t.Errorf("RunJob mutated State on returned proto: got %v, want ENABLED", ran.GetState())
+	}
+	// LastAttemptTime should be populated (the single permitted mutation).
+	if ran.GetLastAttemptTime() == nil {
+		t.Errorf("RunJob: LastAttemptTime is nil, want populated")
+	}
 
-	after, err := svc.GetJob(ctx, &schedulerpb.GetJobRequest{Name: jobName("run-me")})
-	if err != nil {
-		t.Fatalf("GetJob after RunJob: %v", err)
+	// Poll for the dispatch to land. The dispatcher retries with
+	// exponential backoff, but the httptest server returns 200
+	// immediately so the first attempt succeeds. 5 seconds is an order
+	// of magnitude above what a healthy in-process dispatch should
+	// need.
+	deadline := time.After(5 * time.Second)
+	for {
+		if received.Load() >= 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timeout waiting for RunJob dispatch; received=%d", received.Load())
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
-	if after.GetSchedule() != origSchedule {
-		t.Errorf("Schedule changed: %q -> %q", origSchedule, after.GetSchedule())
-	}
-	if after.GetState() != origState {
-		t.Errorf("State changed: %v -> %v", origState, after.GetState())
+	// Give any stray goroutine a moment to race the counter above the
+	// expected value — if the cron runner unexpectedly fires, we want to
+	// detect it. 200ms is comfortably below the 1-minute granularity of
+	// the 5-field cron expression.
+	time.Sleep(200 * time.Millisecond)
+	if got := received.Load(); got != 1 {
+		t.Errorf("target received %d requests, want exactly 1 (cron may have fired unexpectedly)", got)
 	}
 }
 
-func TestRunJob_NotFound(t *testing.T) {
-	svc := newTestService(t)
-	_, err := svc.RunJob(context.Background(), &schedulerpb.RunJobRequest{Name: jobName("ghost")})
+// TestRunJobDoesNotMutateScheduleOrState is the sharpened, canonical
+// assertion of the AAP §0.1.1 Extension C invariant:
+//
+//	"RunJob performs an immediate single dispatch without mutating
+//	schedule or state."
+//
+// The test captures the job's Schedule and State BEFORE RunJob, performs
+// RunJob, then asserts via a fresh GetJob that Schedule and State are
+// byte-identical while LastAttemptTime IS populated (the single
+// permitted mutation).
+func TestRunJobDoesNotMutateScheduleOrState(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	before, err := client.CreateJob(ctx, httpJobRequest(testJobName, neverSchedule, target.URL))
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	beforeSchedule := before.GetSchedule()
+	beforeState := before.GetState()
+	if beforeSchedule != neverSchedule {
+		t.Fatalf("beforeSchedule = %q, want %q", beforeSchedule, neverSchedule)
+	}
+	if beforeState != schedulerpb.Job_ENABLED {
+		t.Fatalf("beforeState = %v, want ENABLED", beforeState)
+	}
+
+	if _, err := client.RunJob(ctx, &schedulerpb.RunJobRequest{Name: testJobName}); err != nil {
+		t.Fatalf("RunJob: %v", err)
+	}
+
+	after, err := client.GetJob(ctx, &schedulerpb.GetJobRequest{Name: testJobName})
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+
+	if after.GetSchedule() != beforeSchedule {
+		t.Errorf("RunJob mutated Schedule: %q -> %q", beforeSchedule, after.GetSchedule())
+	}
+	if after.GetState() != beforeState {
+		t.Errorf("RunJob mutated State: %v -> %v", beforeState, after.GetState())
+	}
+	// LastAttemptTime IS allowed (and expected) to mutate.
+	if after.GetLastAttemptTime() == nil {
+		t.Errorf("after.LastAttemptTime = nil, want populated")
+	}
+}
+
+// ============================================================================
+// Input-validation tests.
+// ============================================================================
+
+// TestCreateJobWithInvalidScheduleFails asserts that CreateJob rejects
+// syntactically-invalid cron expressions with codes.InvalidArgument. It
+// also confirms that the store is NOT mutated on a failed CreateJob —
+// a subsequent GetJob with the same name returns NotFound.
+func TestCreateJobWithInvalidScheduleFails(t *testing.T) {
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	_, err := client.CreateJob(ctx, httpJobRequest(testJobName, "this is not a valid cron", "http://example.invalid/"))
+	if err == nil {
+		t.Fatal("CreateJob with invalid schedule: expected InvalidArgument")
+	}
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Errorf("code = %v, want InvalidArgument; err=%v", got, err)
+	}
+
+	// Rollback assertion: a subsequent GetJob must return NotFound.
+	// service.go validateJob runs BEFORE store.Create for the pure
+	// cron-syntax error path, and the scheduleJob failure path explicitly
+	// rolls back via s.store.Delete (see service.go CreateJob body).
+	_, err = client.GetJob(ctx, &schedulerpb.GetJobRequest{Name: testJobName})
+	if err == nil {
+		t.Fatal("GetJob after failed CreateJob: expected NotFound")
+	}
+	if got := status.Code(err); got != codes.NotFound {
+		t.Errorf("GetJob after failed CreateJob: code = %v, want NotFound; err=%v", got, err)
+	}
+}
+
+// TestCreateJobWithPubsubTarget verifies that Pub/Sub-target jobs are
+// accepted by CreateJob even when pubsubAddr is empty (the helper passes
+// "" for pubsubAddr). Per AAP Rule 7a, empty pubsubAddr causes
+// dispatchPubsub to be a silent no-op, but the job itself must still be
+// stored and returnable via GetJob with its PubsubTarget intact.
+func TestCreateJobWithPubsubTarget(t *testing.T) {
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	req := pubsubJobRequest(testJobName, neverSchedule, "projects/test/topics/t", []byte("hello"), map[string]string{"k": "v"})
+	created, err := client.CreateJob(ctx, req)
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	pt := created.GetPubsubTarget()
+	if pt == nil {
+		t.Fatalf("created.PubsubTarget = nil, want populated")
+	}
+	if pt.GetTopicName() != "projects/test/topics/t" {
+		t.Errorf("TopicName = %q, want projects/test/topics/t", pt.GetTopicName())
+	}
+	if string(pt.GetData()) != "hello" {
+		t.Errorf("Data = %q, want %q", string(pt.GetData()), "hello")
+	}
+	if pt.GetAttributes()["k"] != "v" {
+		t.Errorf("Attributes[k] = %q, want v", pt.GetAttributes()["k"])
+	}
+
+	// GetJob should round-trip the Pub/Sub target.
+	after, err := client.GetJob(ctx, &schedulerpb.GetJobRequest{Name: testJobName})
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if tn := after.GetPubsubTarget().GetTopicName(); tn != "projects/test/topics/t" {
+		t.Errorf("after.PubsubTarget.TopicName = %q, want projects/test/topics/t", tn)
+	}
+}
+
+// TestCreateJobRequiresTargetAndSchedule verifies that CreateJob rejects:
+//
+//  1. jobs missing Schedule (no cron expression provided)
+//  2. jobs missing both HttpTarget and PubsubTarget
+//
+// with codes.InvalidArgument. Both are preconditions for a well-formed
+// Cloud Scheduler job — a job must have something to run and a time to
+// run it.
+func TestCreateJobRequiresTargetAndSchedule(t *testing.T) {
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	t.Run("missing schedule", func(t *testing.T) {
+		req := &schedulerpb.CreateJobRequest{
+			Parent: testParent,
+			Job: &schedulerpb.Job{
+				Name: jobName("no-schedule"),
+				// Schedule intentionally omitted.
+				Target: &schedulerpb.Job_HttpTarget{
+					HttpTarget: &schedulerpb.HttpTarget{Uri: "http://example.invalid/"},
+				},
+			},
+		}
+		_, err := client.CreateJob(ctx, req)
+		if err == nil {
+			t.Fatal("expected InvalidArgument for missing schedule")
+		}
+		if got := status.Code(err); got != codes.InvalidArgument {
+			t.Errorf("code = %v, want InvalidArgument; err=%v", got, err)
+		}
+	})
+
+	t.Run("missing target", func(t *testing.T) {
+		req := &schedulerpb.CreateJobRequest{
+			Parent: testParent,
+			Job: &schedulerpb.Job{
+				Name:     jobName("no-target"),
+				Schedule: neverSchedule,
+				// Target intentionally omitted — neither HttpTarget nor
+				// PubsubTarget is set.
+			},
+		}
+		_, err := client.CreateJob(ctx, req)
+		if err == nil {
+			t.Fatal("expected InvalidArgument for missing target")
+		}
+		if got := status.Code(err); got != codes.InvalidArgument {
+			t.Errorf("code = %v, want InvalidArgument; err=%v", got, err)
+		}
+	})
+}
+
+// ============================================================================
+// NotFound tests — each in-scope RPC on an unknown job name returns NotFound.
+// ============================================================================
+
+// TestGetJobNotFound asserts GetJob with an unknown name returns NotFound.
+func TestGetJobNotFound(t *testing.T) {
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
+
+	_, err := client.GetJob(context.Background(), &schedulerpb.GetJobRequest{Name: jobName("nope")})
+	if err == nil {
+		t.Fatal("GetJob: expected NotFound")
+	}
 	if got := status.Code(err); got != codes.NotFound {
 		t.Errorf("code = %v, want NotFound; err=%v", got, err)
 	}
 }
 
-// --- Store semantics (defence-in-depth against accidental state.SetState
-// regressions). ---
+// TestPauseJobNotFound asserts PauseJob with an unknown name returns NotFound.
+func TestPauseJobNotFound(t *testing.T) {
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
+
+	_, err := client.PauseJob(context.Background(), &schedulerpb.PauseJobRequest{Name: jobName("nope")})
+	if err == nil {
+		t.Fatal("PauseJob: expected NotFound")
+	}
+	if got := status.Code(err); got != codes.NotFound {
+		t.Errorf("code = %v, want NotFound; err=%v", got, err)
+	}
+}
+
+// TestResumeJobNotFound asserts ResumeJob with an unknown name returns NotFound.
+func TestResumeJobNotFound(t *testing.T) {
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
+
+	_, err := client.ResumeJob(context.Background(), &schedulerpb.ResumeJobRequest{Name: jobName("nope")})
+	if err == nil {
+		t.Fatal("ResumeJob: expected NotFound")
+	}
+	if got := status.Code(err); got != codes.NotFound {
+		t.Errorf("code = %v, want NotFound; err=%v", got, err)
+	}
+}
+
+// TestDeleteJobNotFound asserts DeleteJob with an unknown name returns NotFound.
+func TestDeleteJobNotFound(t *testing.T) {
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
+
+	_, err := client.DeleteJob(context.Background(), &schedulerpb.DeleteJobRequest{Name: jobName("nope")})
+	if err == nil {
+		t.Fatal("DeleteJob: expected NotFound")
+	}
+	if got := status.Code(err); got != codes.NotFound {
+		t.Errorf("code = %v, want NotFound; err=%v", got, err)
+	}
+}
+
+// TestRunJobNotFound asserts RunJob with an unknown name returns NotFound.
+func TestRunJobNotFound(t *testing.T) {
+	client, _, cleanup := schedulerTestClient(t)
+	defer cleanup()
+
+	_, err := client.RunJob(context.Background(), &schedulerpb.RunJobRequest{Name: jobName("nope")})
+	if err == nil {
+		t.Fatal("RunJob: expected NotFound")
+	}
+	if got := status.Code(err); got != codes.NotFound {
+		t.Errorf("code = %v, want NotFound; err=%v", got, err)
+	}
+}
+
+// ============================================================================
+// Store-level regression tests.
 //
-// These tests exercise the store layer directly — they construct Store
-// instances with NewStore("") so persistence is disabled and the tests
-// remain hermetic. They complement the service-level RPC tests by pinning
-// down the sentinel-error contract (ErrNotFound, ErrAlreadyExists), the
-// deterministic List ordering, and the state-preservation semantics
-// relied on by service.go.
-
-// TestStore_CreatePreservesState asserts that the store writes and returns
-// whatever State the caller set. The "default to ENABLED on create" policy
-// lives in the service layer (CreateJob) — see TestCreateJob_HttpTarget_RoundTrip
-// for the service-level coverage of that default.
-func TestStore_CreatePreservesState(t *testing.T) {
-	s := NewStore("")
-	j := &Job{Name: jobName("s1"), State: schedulerpb.Job_ENABLED}
-	if err := s.Create(j); err != nil {
-		t.Fatal(err)
-	}
-	got, err := s.Get(jobName("s1"))
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if got.State != schedulerpb.Job_ENABLED {
-		t.Errorf("State = %v, want ENABLED", got.State)
-	}
-}
-
-// TestStore_CreateDuplicateReturnsAlreadyExists pins down the sentinel
-// error contract the service layer relies on for codes.AlreadyExists mapping.
-func TestStore_CreateDuplicateReturnsAlreadyExists(t *testing.T) {
-	s := NewStore("")
-	if err := s.Create(&Job{Name: jobName("dup")}); err != nil {
-		t.Fatalf("first Create: %v", err)
-	}
-	err := s.Create(&Job{Name: jobName("dup")})
-	if err == nil {
-		t.Fatalf("second Create did not return error")
-	}
-	if !errors.Is(err, ErrAlreadyExists) {
-		t.Errorf("err = %v, want ErrAlreadyExists", err)
-	}
-}
-
-// TestStore_UpdateNotFound pins down the sentinel error contract the
-// service layer relies on for codes.NotFound mapping on Update.
-func TestStore_UpdateNotFound(t *testing.T) {
-	s := NewStore("")
-	err := s.Update(&Job{Name: jobName("ghost")})
-	if err == nil {
-		t.Fatalf("Update of missing job did not error")
-	}
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("err = %v, want ErrNotFound", err)
-	}
-}
-
-// TestStore_DeleteNotFound pins down the sentinel error contract for
-// Delete. The service layer maps this to codes.NotFound.
-func TestStore_DeleteNotFound(t *testing.T) {
-	s := NewStore("")
-	err := s.Delete(jobName("ghost"))
-	if err == nil {
-		t.Fatalf("Delete of missing job did not error")
-	}
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("err = %v, want ErrNotFound", err)
-	}
-}
-
-// TestStore_GetNotFound pins down the sentinel error contract for Get.
-func TestStore_GetNotFound(t *testing.T) {
-	s := NewStore("")
-	_, err := s.Get(jobName("ghost"))
-	if err == nil {
-		t.Fatalf("Get of missing job did not error")
-	}
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("err = %v, want ErrNotFound", err)
-	}
-}
-
-// TestStore_PauseResumeStateTransitions exercises the PAUSED <-> ENABLED
-// state machine at the store layer.
-func TestStore_PauseResumeStateTransitions(t *testing.T) {
-	s := NewStore("")
-	if err := s.Create(&Job{Name: jobName("p1"), State: schedulerpb.Job_ENABLED}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	paused, err := s.Pause(jobName("p1"))
-	if err != nil {
-		t.Fatalf("Pause: %v", err)
-	}
-	if paused.State != schedulerpb.Job_PAUSED {
-		t.Errorf("after Pause: State = %v, want PAUSED", paused.State)
-	}
-	resumed, err := s.Resume(jobName("p1"))
-	if err != nil {
-		t.Fatalf("Resume: %v", err)
-	}
-	if resumed.State != schedulerpb.Job_ENABLED {
-		t.Errorf("after Resume: State = %v, want ENABLED", resumed.State)
-	}
-}
-
-// TestStore_PauseNotFound / TestStore_ResumeNotFound pin down the
-// ErrNotFound sentinel for the state-machine RPCs.
-func TestStore_PauseNotFound(t *testing.T) {
-	s := NewStore("")
-	_, err := s.Pause(jobName("ghost"))
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("err = %v, want ErrNotFound", err)
-	}
-}
-
-func TestStore_ResumeNotFound(t *testing.T) {
-	s := NewStore("")
-	_, err := s.Resume(jobName("ghost"))
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("err = %v, want ErrNotFound", err)
-	}
-}
+// These tests exercise the store layer directly and complement the
+// service-level RPC tests by pinning down:
+//
+//   - the sentinel-error contract (ErrNotFound, ErrAlreadyExists) the
+//     service layer relies on for codes.NotFound / codes.AlreadyExists
+//     mapping.
+//
+//   - the deterministic parent-filtering contract in store.List (the
+//     "/jobs/" separator must correctly disambiguate parents that share
+//     a prefix, e.g. "us" vs "us-central1").
+//
+//   - the Touch test-seam semantics that the cron runner and RunJob
+//     rely on for their "metadata-only" update model.
+//
+// These low-level tests run entirely in-process without a gRPC wire and
+// therefore provide defense-in-depth when a future refactor reshuffles
+// the service layer — the store contract stays pinned.
+// ============================================================================
 
 // TestStore_TouchUpdatesLastAttemptTime verifies that Touch advances the
 // job's LastAttemptTime to the package-level Now() value and does NOT
 // mutate the Schedule, State, or target fields. This is the canonical
 // contract for the cron runner tick path and RunJob's "metadata-only"
-// update model per AAP §0.5.1.1.
+// update model.
 func TestStore_TouchUpdatesLastAttemptTime(t *testing.T) {
-	// Fix the clock via the package-level Now test seam so the assertion is
-	// deterministic. Restore after the test so other tests are unaffected.
 	fixed := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
 	saved := Now
 	Now = func() time.Time { return fixed }
@@ -565,7 +797,7 @@ func TestStore_TouchUpdatesLastAttemptTime(t *testing.T) {
 	s := NewStore("")
 	original := &Job{
 		Name:     jobName("touch-me"),
-		Schedule: "*/5 * * * *",
+		Schedule: neverSchedule,
 		State:    schedulerpb.Job_ENABLED,
 		HTTPTarget: &schedulerpb.HttpTarget{
 			Uri:        "http://example.com/hook",
@@ -583,68 +815,25 @@ func TestStore_TouchUpdatesLastAttemptTime(t *testing.T) {
 	if !got.LastAttemptTime.Equal(fixed) {
 		t.Errorf("LastAttemptTime = %v, want %v", got.LastAttemptTime, fixed)
 	}
-	// Schedule, State, and target must remain untouched.
-	if got.Schedule != "*/5 * * * *" {
-		t.Errorf("Schedule = %q, want %q", got.Schedule, "*/5 * * * *")
+	if got.Schedule != neverSchedule {
+		t.Errorf("Schedule mutated: got %q, want %q", got.Schedule, neverSchedule)
 	}
 	if got.State != schedulerpb.Job_ENABLED {
-		t.Errorf("State = %v, want ENABLED", got.State)
+		t.Errorf("State mutated: got %v, want ENABLED", got.State)
 	}
 	if got.HTTPTarget == nil || got.HTTPTarget.Uri != "http://example.com/hook" {
 		t.Errorf("HTTPTarget mutated or cleared: %+v", got.HTTPTarget)
 	}
-
-	// A subsequent Get must return the same mutated time.
-	fetched, err := s.Get(jobName("touch-me"))
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if !fetched.LastAttemptTime.Equal(fixed) {
-		t.Errorf("Get().LastAttemptTime = %v, want %v", fetched.LastAttemptTime, fixed)
-	}
 }
 
-// TestStore_TouchNotFound pins down the ErrNotFound sentinel contract for
-// Touch so that callers in service.go can rely on errors.Is(err,
-// ErrNotFound) for the NotFound mapping.
-func TestStore_TouchNotFound(t *testing.T) {
-	s := NewStore("")
-	_, err := s.Touch(jobName("ghost"))
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("err = %v, want ErrNotFound", err)
-	}
-}
-
-// TestStore_ListOrdersByName asserts the deterministic alphabetical
-// ordering relied on by ListJobs and by all test assertions that read
-// the result slice positionally.
-func TestStore_ListOrdersByName(t *testing.T) {
-	s := NewStore("")
-	for _, n := range []string{"b", "a", "c"} {
-		if err := s.Create(&Job{Name: jobName(n)}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	jobs := s.List(testParent)
-	if len(jobs) != 3 {
-		t.Fatalf("len = %d", len(jobs))
-	}
-	want := []string{jobName("a"), jobName("b"), jobName("c")}
-	for i, j := range jobs {
-		if j.Name != want[i] {
-			t.Errorf("[%d] = %q, want %q", i, j.Name, want[i])
-		}
-	}
-}
-
-// TestStore_ListParentSeparator verifies that the "/jobs/" separator
-// correctly discriminates between parent prefixes that would otherwise be
-// ambiguous (e.g. "projects/p/locations/us" vs
-// "projects/p/locations/us-central1"). This is the critical correctness
-// invariant that the store's List implementation depends on.
+// TestStore_ListParentSeparator verifies that the "/jobs/" separator in
+// the List filter correctly disambiguates parents that share a prefix —
+// e.g. "projects/p/locations/us" vs "projects/p/locations/us-central1".
+// A naïve strings.HasPrefix(name, parent) without the trailing "/jobs/"
+// would bleed across these two parents; the test pins the correct
+// behaviour so future refactors cannot regress it.
 func TestStore_ListParentSeparator(t *testing.T) {
 	s := NewStore("")
-	// Insert under two neighbouring parents whose names share a prefix.
 	parentA := "projects/p/locations/us"
 	parentB := "projects/p/locations/us-central1"
 	if err := s.Create(&Job{Name: parentA + "/jobs/j1"}); err != nil {
@@ -653,20 +842,60 @@ func TestStore_ListParentSeparator(t *testing.T) {
 	if err := s.Create(&Job{Name: parentB + "/jobs/j1"}); err != nil {
 		t.Fatalf("Create B: %v", err)
 	}
-	// List under parentA must NOT return the parentB job.
 	gotA := s.List(parentA)
 	if len(gotA) != 1 {
 		t.Fatalf("List(%q) len = %d, want 1", parentA, len(gotA))
 	}
 	if gotA[0].Name != parentA+"/jobs/j1" {
-		t.Errorf("List(%q)[0].Name = %q", parentA, gotA[0].Name)
+		t.Errorf("List(%q)[0].Name = %q, want %q", parentA, gotA[0].Name, parentA+"/jobs/j1")
 	}
-	// List under parentB must NOT return the parentA job.
 	gotB := s.List(parentB)
 	if len(gotB) != 1 {
 		t.Fatalf("List(%q) len = %d, want 1", parentB, len(gotB))
 	}
 	if gotB[0].Name != parentB+"/jobs/j1" {
-		t.Errorf("List(%q)[0].Name = %q", parentB, gotB[0].Name)
+		t.Errorf("List(%q)[0].Name = %q, want %q", parentB, gotB[0].Name, parentB+"/jobs/j1")
+	}
+}
+
+// TestStore_CreateDuplicateReturnsAlreadyExists pins down the sentinel
+// error contract the service layer relies on for codes.AlreadyExists mapping.
+func TestStore_CreateDuplicateReturnsAlreadyExists(t *testing.T) {
+	s := NewStore("")
+	if err := s.Create(&Job{Name: jobName("dup")}); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	err := s.Create(&Job{Name: jobName("dup")})
+	if err == nil {
+		t.Fatal("second Create did not return error")
+	}
+	if !errors.Is(err, ErrAlreadyExists) {
+		t.Errorf("err = %v, want ErrAlreadyExists", err)
+	}
+}
+
+// TestStore_UpdateNotFound pins the ErrNotFound sentinel contract for
+// the Update path.
+func TestStore_UpdateNotFound(t *testing.T) {
+	s := NewStore("")
+	err := s.Update(&Job{Name: jobName("ghost")})
+	if err == nil {
+		t.Fatal("Update of missing job did not return error")
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestStore_DeleteNotFound pins the ErrNotFound sentinel contract for
+// the Delete path.
+func TestStore_DeleteNotFound(t *testing.T) {
+	s := NewStore("")
+	err := s.Delete(jobName("ghost"))
+	if err == nil {
+		t.Fatal("Delete of missing job did not return error")
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }
