@@ -101,11 +101,12 @@ func (s *Service) Start(ctx context.Context, addr string) error {
 // registerRoutes sets up all GCS JSON API routes.
 //
 // GCS JSON API path structure:
-//   /storage/v1/b                          — list/create buckets
-//   /storage/v1/b/{bucket}                 — get/delete bucket
-//   /storage/v1/b/{bucket}/o               — list objects
-//   /storage/v1/b/{bucket}/o/{object...}   — get/delete object (object can contain /)
-//   /upload/storage/v1/b/{bucket}/o        — upload objects
+//
+//	/storage/v1/b                          — list/create buckets
+//	/storage/v1/b/{bucket}                 — get/delete bucket
+//	/storage/v1/b/{bucket}/o               — list objects
+//	/storage/v1/b/{bucket}/o/{object...}   — get/delete object (object can contain /)
+//	/upload/storage/v1/b/{bucket}/o        — upload objects
 //
 // Object names can contain slashes, so we can't use simple path params.
 // We route by prefix and parse manually.
@@ -337,7 +338,7 @@ func (s *Service) handleNotificationCreate(w http.ResponseWriter, r *http.Reques
 		writeBadRequest(w, "Invalid JSON body")
 		return
 	}
-	if cfg.Topic == "" {
+	if cfg.TopicName == "" {
 		writeBadRequest(w, "topic is required (projects/{project}/topics/{topic})")
 		return
 	}
@@ -450,12 +451,12 @@ func (s *Service) deliverNotification(cfg NotificationConfig, obj Object, eventT
 	// Attributes: AAP-required eventType and bucketId, plus any
 	// user-defined custom_attributes on the config.
 	attrs := map[string]string{
-		"eventType":             eventType,
-		"bucketId":              bucketID,
-		"objectId":              obj.Name,
-		"objectGeneration":      obj.Etag,
-		"payloadFormat":         cfg.PayloadFormat,
-		"notificationConfig":    fmt.Sprintf("projects/_/buckets/%s/notificationConfigs/%s", bucketID, cfg.ID),
+		"eventType":          eventType,
+		"bucketId":           bucketID,
+		"objectId":           obj.Name,
+		"objectGeneration":   obj.Etag,
+		"payloadFormat":      cfg.PayloadFormat,
+		"notificationConfig": fmt.Sprintf("projects/_/buckets/%s/notificationConfigs/%s", bucketID, cfg.ID),
 	}
 	for k, v := range cfg.CustomAttributes {
 		// Don't let user-defined attributes override the canonical ones.
@@ -464,8 +465,8 @@ func (s *Service) deliverNotification(cfg NotificationConfig, obj Object, eventT
 		}
 	}
 
-	if err := publishToPubsub(s.pubsubAddr, cfg.Topic, payload, attrs); err != nil {
-		fmt.Fprintf(os.Stderr, "[gcs] notification: deliver %s → %s: %v\n", obj.Name, cfg.Topic, err)
+	if err := publishToPubsub(s.pubsubAddr, cfg.TopicName, payload, attrs); err != nil {
+		fmt.Fprintf(os.Stderr, "[gcs] notification: deliver %s → %s: %v\n", obj.Name, cfg.TopicName, err)
 	}
 }
 

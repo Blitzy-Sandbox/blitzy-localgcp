@@ -122,8 +122,8 @@ func TestNotification_Create_PUT_Success(t *testing.T) {
 	if got.Kind != "storage#notification" {
 		t.Fatalf("expected kind 'storage#notification', got %q", got.Kind)
 	}
-	if got.Topic != "projects/test/topics/my-topic" {
-		t.Fatalf("expected topic preserved, got %q", got.Topic)
+	if got.TopicName != "projects/test/topics/my-topic" {
+		t.Fatalf("expected topic preserved, got %q", got.TopicName)
 	}
 	if len(got.EventTypes) != 2 || got.EventTypes[0] != "OBJECT_FINALIZE" || got.EventTypes[1] != "OBJECT_DELETE" {
 		t.Fatalf("expected EventTypes [OBJECT_FINALIZE,OBJECT_DELETE], got %v", got.EventTypes)
@@ -153,8 +153,8 @@ func TestNotification_Create_POST_AlsoSucceeds(t *testing.T) {
 
 	var got NotificationConfig
 	decodeBody(t, resp, &got)
-	if got.Topic != "projects/test/topics/t2" {
-		t.Fatalf("expected topic preserved, got %q", got.Topic)
+	if got.TopicName != "projects/test/topics/t2" {
+		t.Fatalf("expected topic preserved, got %q", got.TopicName)
 	}
 	if got.ID == "" {
 		t.Fatalf("expected server-assigned ID")
@@ -289,8 +289,8 @@ func TestNotification_Get_Success(t *testing.T) {
 	if got.ID != created.ID {
 		t.Fatalf("expected ID %q, got %q", created.ID, got.ID)
 	}
-	if got.Topic != created.Topic {
-		t.Fatalf("expected Topic preserved, got %q", got.Topic)
+	if got.TopicName != created.TopicName {
+		t.Fatalf("expected Topic preserved, got %q", got.TopicName)
 	}
 }
 
@@ -394,8 +394,8 @@ func TestNotification_List_Multiple(t *testing.T) {
 			t.Fatalf("item %d has empty ID", i)
 		}
 		want := fmt.Sprintf("projects/test/topics/t%d", i)
-		if it.Topic != want {
-			t.Fatalf("item %d topic want %q got %q", i, want, it.Topic)
+		if it.TopicName != want {
+			t.Fatalf("item %d topic want %q got %q", i, want, it.TopicName)
 		}
 	}
 }
@@ -571,8 +571,8 @@ func TestNotification_RoundTrip(t *testing.T) {
 	assertStatus(t, gresp, 200)
 	var got NotificationConfig
 	decodeBody(t, gresp, &got)
-	if got.Topic != "projects/test/topics/rt" {
-		t.Fatalf("round-trip topic mismatch: %q", got.Topic)
+	if got.TopicName != "projects/test/topics/rt" {
+		t.Fatalf("round-trip topic mismatch: %q", got.TopicName)
 	}
 
 	// 4. Delete.
@@ -612,7 +612,7 @@ func TestNotification_RoundTrip(t *testing.T) {
 func TestStore_CreateNotification_MissingBucket(t *testing.T) {
 	s := NewStore("")
 	_, err := s.CreateNotification("ghost", NotificationConfig{
-		Topic: "projects/test/topics/t",
+		TopicName: "projects/test/topics/t",
 	})
 	if err == nil {
 		t.Fatalf("expected error on missing bucket, got nil")
@@ -631,7 +631,7 @@ func TestStore_NotificationsForBucket_Snapshot(t *testing.T) {
 		t.Fatalf("CreateBucket: %v", err)
 	}
 	if _, err := s.CreateNotification("snap", NotificationConfig{
-		Topic:      "projects/test/topics/t",
+		TopicName:  "projects/test/topics/t",
 		EventTypes: []string{"OBJECT_FINALIZE"},
 	}); err != nil {
 		t.Fatalf("CreateNotification: %v", err)
@@ -641,18 +641,18 @@ func TestStore_NotificationsForBucket_Snapshot(t *testing.T) {
 	if len(snap) != 1 {
 		t.Fatalf("expected 1 config in snapshot, got %d", len(snap))
 	}
-	if snap[0].Topic != "projects/test/topics/t" {
-		t.Fatalf("snapshot topic mismatch: %q", snap[0].Topic)
+	if snap[0].TopicName != "projects/test/topics/t" {
+		t.Fatalf("snapshot topic mismatch: %q", snap[0].TopicName)
 	}
 
 	// Mutating the snapshot must not affect store state.
-	snap[0].Topic = "projects/test/topics/hacked"
+	snap[0].TopicName = "projects/test/topics/hacked"
 	gotList, ok := s.ListNotifications("snap")
 	if !ok {
 		t.Fatal("expected bucket to exist")
 	}
-	if gotList[0].Topic != "projects/test/topics/t" {
-		t.Fatalf("snapshot mutation leaked into store: %q", gotList[0].Topic)
+	if gotList[0].TopicName != "projects/test/topics/t" {
+		t.Fatalf("snapshot mutation leaked into store: %q", gotList[0].TopicName)
 	}
 }
 

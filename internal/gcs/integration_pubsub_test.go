@@ -163,7 +163,7 @@ func createNotifConfig(t *testing.T, base, bucket, topic string, eventTypes []st
 	t.Helper()
 
 	cfg := NotificationConfig{
-		Topic:            topic,
+		TopicName:        topic,
 		EventTypes:       eventTypes,
 		ObjectNamePrefix: prefix,
 	}
@@ -664,4 +664,3 @@ func objectIDsOf(msgs []*pubsubpb.ReceivedMessage) []string {
 	}
 	return out
 }
-

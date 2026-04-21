@@ -47,19 +47,57 @@ type Object struct {
 // NotificationConfig is a Cloud Storage notification configuration that
 // routes object events to a Pub/Sub topic. See AAP Extension B.
 //
-// The Topic field is a full resource name in the form
+// The TopicName field is a full resource name in the form
 // `projects/{project}/topics/{topic}` — the format produced by the
-// Cloud Storage API when using the JSON representation.
+// Cloud Storage API when using the JSON representation. Its JSON tag
+// remains "topic" so the on-the-wire representation matches the
+// canonical GCS notification config schema exactly.
+//
+// The struct is intentionally defined as a value type so both Store
+// fan-out paths (snapshot copies in NotificationsForBucket) and the
+// HTTP handler responses in service.go can marshal without leaking
+// pointer aliases to internal state.
 type NotificationConfig struct {
-	Kind             string            `json:"kind"`             // "storage#notification"
-	ID               string            `json:"id"`               // per-bucket unique id
-	Topic            string            `json:"topic"`            // projects/{p}/topics/{t}
-	PayloadFormat    string            `json:"payload_format"`   // JSON_API_V1 | NONE
-	EventTypes       []string          `json:"event_types,omitempty"`
+	// Kind is the resource kind, always "storage#notification".
+	Kind string `json:"kind"`
+
+	// ID is the per-bucket unique identifier assigned by the Store at
+	// creation time.
+	ID string `json:"id"`
+
+	// TopicName is the fully-qualified Pub/Sub topic name that object
+	// event notifications are published to, typically of the form
+	// "projects/{project}/topics/{topic}". The JSON key remains "topic"
+	// for wire-format parity with the real GCS notification config API.
+	TopicName string `json:"topic"`
+
+	// PayloadFormat controls what body is sent to the topic. The
+	// emulator produces "JSON_API_V1" only; "NONE" is accepted for
+	// round-trip compatibility.
+	PayloadFormat string `json:"payload_format"`
+
+	// EventTypes is the list of object event types this config
+	// subscribes to. Supported values: "OBJECT_FINALIZE",
+	// "OBJECT_DELETE". Empty means "all supported events" per GCS
+	// convention, which the service layer expands at fan-out time.
+	EventTypes []string `json:"event_types,omitempty"`
+
+	// CustomAttributes carries extra Pub/Sub message attributes that
+	// are merged on top of the standard {eventType, bucketId} attrs at
+	// delivery time.
 	CustomAttributes map[string]string `json:"custom_attributes,omitempty"`
-	ObjectNamePrefix string            `json:"object_name_prefix,omitempty"`
-	Etag             string            `json:"etag,omitempty"`
-	SelfLink         string            `json:"selfLink,omitempty"`
+
+	// ObjectNamePrefix filters which object names trigger this
+	// notification. An empty string matches all objects.
+	ObjectNamePrefix string `json:"object_name_prefix,omitempty"`
+
+	// Etag is the server-assigned version identifier for optimistic
+	// concurrency, set on create.
+	Etag string `json:"etag,omitempty"`
+
+	// SelfLink is the fully-qualified URL to this notification config,
+	// set on create.
+	SelfLink string `json:"selfLink,omitempty"`
 }
 
 // NotificationList is the response for ListNotifications.
@@ -442,10 +480,10 @@ func (s *Store) ListObjects(bucket, prefix, delimiter string, maxResults int) ([
 // --- Persistence ---
 
 type persistedState struct {
-	Buckets       []Bucket                          `json:"buckets"`
-	Objects       map[string][]persistedObj         `json:"objects"`
-	Notifications map[string][]NotificationConfig   `json:"notifications,omitempty"`
-	NotifCounter  uint64                            `json:"notifCounter,omitempty"`
+	Buckets       []Bucket                        `json:"buckets"`
+	Objects       map[string][]persistedObj       `json:"objects"`
+	Notifications map[string][]NotificationConfig `json:"notifications,omitempty"`
+	NotifCounter  uint64                          `json:"notifCounter,omitempty"`
 }
 
 type persistedObj struct {
