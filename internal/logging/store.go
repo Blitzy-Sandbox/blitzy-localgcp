@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -13,6 +14,26 @@ import (
 
 // maxEntries is the maximum number of log entries retained in memory.
 const maxEntries = 10000
+
+// Sentinel errors returned (wrapped) by the sink CRUD methods below. The
+// Service layer translates these into gRPC status codes (codes.NotFound,
+// codes.AlreadyExists) by matching via errors.Is — the idiomatic Go
+// sentinel-error pattern used by io.EOF, sql.ErrNoRows, etc.
+//
+// All sink CRUD methods on Store that return an error for a missing or
+// duplicate record wrap one of these sentinels using fmt.Errorf("... : %w",
+// ErrSinkXxx). Callers MUST prefer errors.Is(err, ErrSinkNotFound) over
+// substring matching on the error message, which remains for backwards
+// compatibility with the pre-sentinel error-translation path in service.go.
+var (
+	// ErrSinkNotFound is returned wrapped when a sink lookup, update, or
+	// delete targets a name that does not exist in the registry.
+	ErrSinkNotFound = errors.New("sink not found")
+
+	// ErrSinkAlreadyExists is returned wrapped when a CreateSink call
+	// targets a name that already exists in the registry.
+	ErrSinkAlreadyExists = errors.New("sink already exists")
+)
 
 // Sink is an in-memory representation of a Cloud Logging sink. The fields are
 // a subset of google.logging.v2.LogSink — only those required by AAP §0.5.1.2
@@ -147,7 +168,10 @@ func (s *Store) CreateSink(sink Sink) (*Sink, error) {
 		return nil, fmt.Errorf("sink name is required")
 	}
 	if _, exists := s.sinks[sink.Name]; exists {
-		return nil, fmt.Errorf("sink %q already exists", sink.Name)
+		// Wrap the sentinel so callers can use errors.Is while
+		// preserving the "already exists" substring that the pre-sentinel
+		// error-translation path in service.go depends on.
+		return nil, fmt.Errorf("sink %q: %w", sink.Name, ErrSinkAlreadyExists)
 	}
 
 	now := timestamppb.New(Now())
@@ -195,7 +219,10 @@ func (s *Store) UpdateSink(sink Sink) (*Sink, error) {
 	}
 	existing, ok := s.sinks[sink.Name]
 	if !ok {
-		return nil, fmt.Errorf("sink %q not found", sink.Name)
+		// Wrap the sentinel so callers can use errors.Is while
+		// preserving the "not found" substring that the pre-sentinel
+		// error-translation path in service.go depends on.
+		return nil, fmt.Errorf("sink %q: %w", sink.Name, ErrSinkNotFound)
 	}
 
 	existing.Destination = sink.Destination
