@@ -3,12 +3,12 @@
 // Rule 8 verification for the Cloud Run 8200-8299 host port pool.
 //
 // AAP §0.7.1.9 requires that:
-//   1. Ports 8200-8299 are managed as an in-use set in store.go.
-//   2. 5 consecutive CreateService calls allocate 5 distinct ports.
-//   3. 1 DeleteService call frees that port for reuse.
-//   4. The 101st CreateService call (with no deletions) returns
-//      codes.ResourceExhausted with the exact message
-//      "localgcp: cloud run port pool exhausted (max 100 concurrent services)".
+//  1. Ports 8200-8299 are managed as an in-use set in store.go.
+//  2. 5 consecutive CreateService calls allocate 5 distinct ports.
+//  3. 1 DeleteService call frees that port for reuse.
+//  4. The 101st CreateService call (with no deletions) returns
+//     codes.ResourceExhausted with the exact message
+//     "localgcp: cloud run port pool exhausted (max 100 concurrent services)".
 //
 // This test suite exercises both the Store-level API (fast, no real
 // sockets) AND the Service-level CreateService/DeleteService path

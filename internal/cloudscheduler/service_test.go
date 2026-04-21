@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	schedulerpb "cloud.google.com/go/scheduler/apiv1/schedulerpb"
 	"google.golang.org/grpc/codes"
@@ -543,6 +544,72 @@ func TestStore_PauseNotFound(t *testing.T) {
 func TestStore_ResumeNotFound(t *testing.T) {
 	s := NewStore("")
 	_, err := s.Resume(jobName("ghost"))
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestStore_TouchUpdatesLastAttemptTime verifies that Touch advances the
+// job's LastAttemptTime to the package-level Now() value and does NOT
+// mutate the Schedule, State, or target fields. This is the canonical
+// contract for the cron runner tick path and RunJob's "metadata-only"
+// update model per AAP §0.5.1.1.
+func TestStore_TouchUpdatesLastAttemptTime(t *testing.T) {
+	// Fix the clock via the package-level Now test seam so the assertion is
+	// deterministic. Restore after the test so other tests are unaffected.
+	fixed := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	saved := Now
+	Now = func() time.Time { return fixed }
+	defer func() { Now = saved }()
+
+	s := NewStore("")
+	original := &Job{
+		Name:     jobName("touch-me"),
+		Schedule: "*/5 * * * *",
+		State:    schedulerpb.Job_ENABLED,
+		HTTPTarget: &schedulerpb.HttpTarget{
+			Uri:        "http://example.com/hook",
+			HttpMethod: schedulerpb.HttpMethod_POST,
+		},
+	}
+	if err := s.Create(original); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := s.Touch(jobName("touch-me"))
+	if err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+	if !got.LastAttemptTime.Equal(fixed) {
+		t.Errorf("LastAttemptTime = %v, want %v", got.LastAttemptTime, fixed)
+	}
+	// Schedule, State, and target must remain untouched.
+	if got.Schedule != "*/5 * * * *" {
+		t.Errorf("Schedule = %q, want %q", got.Schedule, "*/5 * * * *")
+	}
+	if got.State != schedulerpb.Job_ENABLED {
+		t.Errorf("State = %v, want ENABLED", got.State)
+	}
+	if got.HTTPTarget == nil || got.HTTPTarget.Uri != "http://example.com/hook" {
+		t.Errorf("HTTPTarget mutated or cleared: %+v", got.HTTPTarget)
+	}
+
+	// A subsequent Get must return the same mutated time.
+	fetched, err := s.Get(jobName("touch-me"))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !fetched.LastAttemptTime.Equal(fixed) {
+		t.Errorf("Get().LastAttemptTime = %v, want %v", fetched.LastAttemptTime, fixed)
+	}
+}
+
+// TestStore_TouchNotFound pins down the ErrNotFound sentinel contract for
+// Touch so that callers in service.go can rely on errors.Is(err,
+// ErrNotFound) for the NotFound mapping.
+func TestStore_TouchNotFound(t *testing.T) {
+	s := NewStore("")
+	_, err := s.Touch(jobName("ghost"))
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}

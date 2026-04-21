@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -14,6 +15,39 @@ import (
 	"strings"
 	"sync"
 	"time"
+)
+
+// Sentinel errors returned by Store methods. They are wrapped via
+// fmt.Errorf("...: %w", Err...) so callers can match the category of
+// failure with errors.Is(err, ErrBucketNotFound) while still preserving
+// the contextual error message for logging and API responses.
+//
+// These sentinels are the authoritative error-category source for the
+// gcs service layer (internal/gcs/service.go) which maps each category
+// to the corresponding HTTP status code (404, 409, ...). Adding a new
+// sentinel here requires adding a matching errors.Is branch in the
+// service layer — the two are contractually paired.
+var (
+	// ErrBucketNotFound is returned when an operation references a
+	// bucket that does not exist. Maps to HTTP 404.
+	ErrBucketNotFound = errors.New("gcs: bucket not found")
+
+	// ErrObjectNotFound is returned when an operation references an
+	// object that does not exist. Maps to HTTP 404.
+	ErrObjectNotFound = errors.New("gcs: object not found")
+
+	// ErrNotificationNotFound is returned when an operation references a
+	// notification config id that does not exist for the bucket.
+	// Maps to HTTP 404.
+	ErrNotificationNotFound = errors.New("gcs: notification not found")
+
+	// ErrBucketNotEmpty is returned when DeleteBucket is called against a
+	// bucket that still contains objects. Maps to HTTP 409.
+	ErrBucketNotEmpty = errors.New("gcs: bucket not empty")
+
+	// ErrBucketAlreadyExists is returned when CreateBucket is called with
+	// a name that is already registered. Maps to HTTP 409.
+	ErrBucketAlreadyExists = errors.New("gcs: bucket already exists")
 )
 
 // Bucket represents a GCS bucket.
@@ -163,7 +197,7 @@ func (s *Store) CreateBucket(name, project string) (*Bucket, error) {
 	defer s.mu.Unlock()
 
 	if _, exists := s.buckets[name]; exists {
-		return nil, fmt.Errorf("conflict: bucket %q already exists", name)
+		return nil, fmt.Errorf("conflict: bucket %q: %w", name, ErrBucketAlreadyExists)
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -208,10 +242,10 @@ func (s *Store) DeleteBucket(name string) error {
 	defer s.mu.Unlock()
 
 	if _, exists := s.buckets[name]; !exists {
-		return fmt.Errorf("not found: bucket %q", name)
+		return fmt.Errorf("bucket %q: %w", name, ErrBucketNotFound)
 	}
 	if objs, ok := s.objects[name]; ok && len(objs) > 0 {
-		return fmt.Errorf("conflict: bucket %q is not empty", name)
+		return fmt.Errorf("bucket %q: %w", name, ErrBucketNotEmpty)
 	}
 
 	delete(s.buckets, name)
@@ -235,7 +269,7 @@ func (s *Store) CreateNotification(bucket string, cfg NotificationConfig) (*Noti
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.buckets[bucket]; !exists {
-		return nil, fmt.Errorf("not found: bucket %q", bucket)
+		return nil, fmt.Errorf("bucket %q: %w", bucket, ErrBucketNotFound)
 	}
 	if _, ok := s.notifications[bucket]; !ok {
 		s.notifications[bucket] = make(map[string]*NotificationConfig)
@@ -303,10 +337,10 @@ func (s *Store) DeleteNotification(bucket, id string) error {
 	defer s.mu.Unlock()
 	byID, ok := s.notifications[bucket]
 	if !ok {
-		return fmt.Errorf("not found: bucket %q", bucket)
+		return fmt.Errorf("bucket %q: %w", bucket, ErrBucketNotFound)
 	}
 	if _, ok := byID[id]; !ok {
-		return fmt.Errorf("not found: notification %q in bucket %q", id, bucket)
+		return fmt.Errorf("notification %q in bucket %q: %w", id, bucket, ErrNotificationNotFound)
 	}
 	delete(byID, id)
 	s.persist()
@@ -334,7 +368,7 @@ func (s *Store) PutObject(bucket, name, contentType string, content []byte) (*Ob
 	defer s.mu.Unlock()
 
 	if _, exists := s.buckets[bucket]; !exists {
-		return nil, fmt.Errorf("not found: bucket %q", bucket)
+		return nil, fmt.Errorf("bucket %q: %w", bucket, ErrBucketNotFound)
 	}
 
 	if contentType == "" {
@@ -393,10 +427,10 @@ func (s *Store) DeleteObject(bucket, name string) error {
 
 	objs, ok := s.objects[bucket]
 	if !ok {
-		return fmt.Errorf("not found: bucket %q", bucket)
+		return fmt.Errorf("bucket %q: %w", bucket, ErrBucketNotFound)
 	}
 	if _, ok := objs[name]; !ok {
-		return fmt.Errorf("not found: object %q in bucket %q", name, bucket)
+		return fmt.Errorf("object %q in bucket %q: %w", name, bucket, ErrObjectNotFound)
 	}
 
 	delete(objs, name)
@@ -409,16 +443,16 @@ func (s *Store) CopyObject(srcBucket, srcName, dstBucket, dstName string) (*Obje
 	defer s.mu.Unlock()
 
 	if _, exists := s.buckets[dstBucket]; !exists {
-		return nil, fmt.Errorf("not found: bucket %q", dstBucket)
+		return nil, fmt.Errorf("bucket %q: %w", dstBucket, ErrBucketNotFound)
 	}
 
 	srcObjs, ok := s.objects[srcBucket]
 	if !ok {
-		return nil, fmt.Errorf("not found: bucket %q", srcBucket)
+		return nil, fmt.Errorf("bucket %q: %w", srcBucket, ErrBucketNotFound)
 	}
 	src, ok := srcObjs[srcName]
 	if !ok {
-		return nil, fmt.Errorf("not found: object %q in bucket %q", srcName, srcBucket)
+		return nil, fmt.Errorf("object %q in bucket %q: %w", srcName, srcBucket, ErrObjectNotFound)
 	}
 
 	// Make an independent copy of the content.

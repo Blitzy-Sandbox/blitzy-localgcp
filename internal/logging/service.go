@@ -17,15 +17,23 @@
 // a fire-and-forget path (Rule 3): delivery failures are logged to stderr
 // and never returned to the caller.
 //
-// Rule 7a: the New(dataDir, quiet) constructor signature is preserved. The
-// two new loopback endpoints (pubsubAddr, gcsAddr) are configured
-// post-construction via SetPubsubEndpoint / SetGcsEndpoint setters. Empty
-// addresses silently disable the corresponding fan-out branch with no
-// error and no log.
+// Rule 7a: the New constructor accepts trailing variadic address arguments
+// per AAP §0.5.1.2. Callers may invoke:
+//
+//	New(dataDir, quiet)                         // no loopback endpoints
+//	New(dataDir, quiet, pubsubAddr)             // Pub/Sub fan-out only
+//	New(dataDir, quiet, pubsubAddr, gcsAddr)    // both fan-out branches
+//
+// Empty strings (at either position) silently disable the corresponding
+// fan-out branch with no error and no log. The legacy
+// SetPubsubEndpoint / SetGcsEndpoint setters remain available for
+// post-construction configuration and are semantically equivalent to
+// passing the addresses at construction time.
 package logging
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -37,7 +45,6 @@ import (
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // Service implements the Cloud Logging emulator.
@@ -65,19 +72,33 @@ type Service struct {
 
 // New creates a new Cloud Logging service.
 //
-// The signature (dataDir, quiet) is preserved verbatim to honor AAP Rule 7a
-// — existing service_test.go call sites `New("", true)` MUST continue to
-// compile unchanged. The two loopback endpoints used by the sink fan-out
-// path are configured post-construction via SetPubsubEndpoint and
-// SetGcsEndpoint.
-func New(dataDir string, quiet bool) *Service {
+// The signature (dataDir, quiet, addrs ...string) is the AAP §0.5.1.2
+// variadic form. addrs[0], if present, is the loopback Pub/Sub endpoint
+// used by `pubsub://...` and `pubsub.googleapis.com/...` sink
+// destinations; addrs[1], if present, is the loopback GCS endpoint used
+// by `storage.googleapis.com/...` sink destinations. Missing or empty
+// values silently disable the corresponding fan-out branch (Rule 7a —
+// no error, no log).
+//
+// Existing `New("", true)` call sites in service_test.go and integration
+// tests continue to compile unchanged because variadic parameters accept
+// zero trailing arguments. Callers that prefer post-construction wiring
+// can still invoke the SetPubsubEndpoint / SetGcsEndpoint setters.
+func New(dataDir string, quiet bool, addrs ...string) *Service {
 	logger := log.New(os.Stderr, "[logging] ", log.LstdFlags)
-	return &Service{
+	s := &Service{
 		dataDir: dataDir,
 		quiet:   quiet,
 		logger:  logger,
 		store:   NewStore(),
 	}
+	if len(addrs) >= 1 {
+		s.pubsubAddr = addrs[0]
+	}
+	if len(addrs) >= 2 {
+		s.gcsAddr = addrs[1]
+	}
+	return s
 }
 
 // SetPubsubEndpoint configures the loopback Pub/Sub endpoint used by the
@@ -216,12 +237,14 @@ func (s *Service) CreateSink(_ context.Context, req *loggingpb.CreateSinkRequest
 	}
 	stored, err := s.store.CreateSink(internal)
 	if err != nil {
-		// Distinguish already-exists from other errors using string match.
-		msg := err.Error()
-		if contains(msg, "already exists") {
-			return nil, status.Errorf(codes.AlreadyExists, "%s", msg)
+		// Distinguish already-exists from other errors via the
+		// package-level ErrSinkAlreadyExists sentinel (errors.Is, not
+		// substring match — a future store message change must not
+		// silently break the gRPC status code mapping).
+		if errors.Is(err, ErrSinkAlreadyExists) {
+			return nil, status.Errorf(codes.AlreadyExists, "%s", err.Error())
 		}
-		return nil, status.Errorf(codes.Internal, "%s", msg)
+		return nil, status.Errorf(codes.Internal, "%s", err.Error())
 	}
 	return toLogSink(stored), nil
 }
@@ -259,11 +282,12 @@ func (s *Service) UpdateSink(_ context.Context, req *loggingpb.UpdateSinkRequest
 	}
 	stored, err := s.store.UpdateSink(internal)
 	if err != nil {
-		msg := err.Error()
-		if contains(msg, "not found") {
-			return nil, status.Errorf(codes.NotFound, "%s", msg)
+		// Distinguish not-found from other errors via the package-level
+		// ErrSinkNotFound sentinel (errors.Is, not substring match).
+		if errors.Is(err, ErrSinkNotFound) {
+			return nil, status.Errorf(codes.NotFound, "%s", err.Error())
 		}
-		return nil, status.Errorf(codes.Internal, "%s", msg)
+		return nil, status.Errorf(codes.Internal, "%s", err.Error())
 	}
 	return toLogSink(stored), nil
 }
@@ -299,41 +323,23 @@ func (s *Service) ListSinks(_ context.Context, req *loggingpb.ListSinksRequest) 
 // --- internal helpers ---
 
 // toLogSink translates an internal Sink to the gRPC LogSink proto.
+//
+// CreateTime is always populated by Store.CreateSink at the moment the
+// sink is inserted, so the stored value is trusted here without a
+// fallback. UpdateTime is populated by CreateSink (to match CreateTime)
+// and refreshed by UpdateSink, so it too is trusted as non-nil.
 func toLogSink(s *Sink) *loggingpb.LogSink {
 	if s == nil {
 		return nil
 	}
-	ls := &loggingpb.LogSink{
+	return &loggingpb.LogSink{
 		Name:           s.Name,
 		Destination:    s.Destination,
 		Filter:         s.Filter,
 		WriterIdentity: s.WriterIdentity,
+		CreateTime:     s.CreateTime,
+		UpdateTime:     s.UpdateTime,
 	}
-	if s.CreateTime != nil {
-		ls.CreateTime = s.CreateTime
-	} else {
-		ls.CreateTime = timestamppb.New(Now())
-	}
-	if s.UpdateTime != nil {
-		ls.UpdateTime = s.UpdateTime
-	} else {
-		ls.UpdateTime = ls.CreateTime
-	}
-	return ls
-}
-
-// contains is a lightweight substring check used only for error-code
-// dispatch above. We deliberately do not import strings in this file
-// because it would force an import alongside the sink_delivery.go file's
-// already-imported strings — pulling this single helper keeps the import
-// set explicit in this file.
-func contains(haystack, needle string) bool {
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Service) loggingInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {

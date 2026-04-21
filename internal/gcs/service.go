@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -43,27 +44,47 @@ type resumableUpload struct {
 
 // New creates a new GCS service.
 //
-// The signature is intentionally preserved as (dataDir, quiet) to honor the
-// AAP Rule 7a "zero call-site changes in test files" criterion. The
-// cross-service Pub/Sub loopback address is configured post-construction
-// via SetPubsubEndpoint, matching the setter pattern used by the Cloud Run
-// service package.
-func New(dataDir string, quiet bool) *Service {
+// Per AAP §0.1.1 and Rule 7a, New accepts trailing variadic address
+// arguments so callers may configure the cross-service loopback endpoints
+// at construction time. Currently only a single address is consumed:
+//
+//	New(dataDir, quiet)                // no loopback endpoints
+//	New(dataDir, quiet, pubsubAddr)    // enable Pub/Sub notification fan-out
+//
+// An empty string (or omitted argument) silently disables notification
+// fan-out — no error is raised, no log line is emitted, and notification
+// publishing becomes a no-op. This preserves the "zero call-site changes
+// in existing test files" criterion of Rule 7a because the testServer
+// helpers call New("", true) which leaves pubsubAddr empty and thereby
+// dormant.
+//
+// Extra trailing arguments beyond the first are reserved for future
+// endpoints and are currently ignored. The SetPubsubEndpoint method is
+// preserved as a convenience for post-construction wiring, but the
+// variadic constructor form is the AAP-canonical API.
+func New(dataDir string, quiet bool, addrs ...string) *Service {
 	logger := log.New(os.Stderr, "[gcs] ", log.LstdFlags)
-	return &Service{
+	s := &Service{
 		dataDir:    dataDir,
 		quiet:      quiet,
 		logger:     logger,
 		store:      NewStore(dataDir),
 		resumables: make(map[string]*resumableUpload),
 	}
+	if len(addrs) >= 1 {
+		s.pubsubAddr = addrs[0]
+	}
+	return s
 }
 
 // SetPubsubEndpoint configures the loopback Pub/Sub endpoint used by the
 // notification-config fan-out path. An empty string disables fan-out
 // (silently skipped — no error, no log) per AAP Rule 7a.
 //
-// This method must be called before Start — the value is read from fan-out
+// This method is preserved for backward compatibility with callers that
+// construct the service without a pubsub address and wire it later. The
+// variadic New(..., pubsubAddr) form is the preferred API. This method
+// must be called before Start — the value is read from fan-out
 // goroutines without synchronization. Calling it after Start is racy.
 func (s *Service) SetPubsubEndpoint(addr string) {
 	s.pubsubAddr = addr
@@ -274,7 +295,7 @@ func (s *Service) handleCreateBucket(w http.ResponseWriter, r *http.Request) {
 
 	b, err := s.store.CreateBucket(body.Name, project)
 	if err != nil {
-		if strings.Contains(err.Error(), "conflict") {
+		if errors.Is(err, ErrBucketAlreadyExists) {
 			writeConflict(w, fmt.Sprintf("You already own this bucket: %s", body.Name))
 			return
 		}
@@ -306,11 +327,12 @@ func (s *Service) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handleDeleteBucket(w http.ResponseWriter, r *http.Request, name string) {
 	err := s.store.DeleteBucket(name)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		switch {
+		case errors.Is(err, ErrBucketNotFound):
 			writeNotFound(w, fmt.Sprintf("The specified bucket does not exist: %s", name))
-		} else if strings.Contains(err.Error(), "not empty") {
+		case errors.Is(err, ErrBucketNotEmpty):
 			writeConflict(w, "The bucket you tried to delete is not empty.")
-		} else {
+		default:
 			writeError(w, http.StatusInternalServerError, "internalError", err.Error())
 		}
 		return
@@ -386,7 +408,7 @@ func (s *Service) handleNotificationList(w http.ResponseWriter, r *http.Request,
 
 func (s *Service) handleNotificationDelete(w http.ResponseWriter, r *http.Request, bucket, id string) {
 	if err := s.store.DeleteNotification(bucket, id); err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, ErrBucketNotFound) || errors.Is(err, ErrNotificationNotFound) {
 			writeNotFound(w, fmt.Sprintf("No such notification: %s/%s", bucket, id))
 			return
 		}
@@ -527,7 +549,7 @@ func (s *Service) handleDeleteObject(w http.ResponseWriter, r *http.Request, buc
 	meta, _, existed := s.store.GetObject(bucket, name)
 
 	if err := s.store.DeleteObject(bucket, name); err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, ErrBucketNotFound) || errors.Is(err, ErrObjectNotFound) {
 			writeNotFound(w, fmt.Sprintf("No such object: %s/%s", bucket, name))
 		} else {
 			writeError(w, http.StatusInternalServerError, "internalError", err.Error())
@@ -594,7 +616,7 @@ func (s *Service) handleCopyObject(w http.ResponseWriter, r *http.Request, rest 
 
 	obj, err := s.store.CopyObject(srcBucket, srcObject, dstBucket, dstObject)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, ErrBucketNotFound) || errors.Is(err, ErrObjectNotFound) {
 			writeNotFound(w, err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "internalError", err.Error())

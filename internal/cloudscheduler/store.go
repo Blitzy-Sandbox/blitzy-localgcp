@@ -258,6 +258,35 @@ func (s *Store) Resume(name string) (*Job, error) {
 	return j, nil
 }
 
+// Touch records that a dispatch attempt occurred for the named job by
+// setting its LastAttemptTime to the current wall-clock time (via the
+// package-level Now test seam so tests can fix time). The job's Schedule,
+// State, and target fields are intentionally NOT mutated — Touch is a
+// pure metadata update suitable for both the cron runner tick path and
+// the manual RunJob path.
+//
+// Returns the updated Job pointer (the same pointer the Store holds) or
+// ErrNotFound if the named job does not exist. On success the updated
+// job is persisted to disk (when persistence is enabled). Any
+// persistence error short-circuits the return so the caller observes a
+// nil Job on failure, matching the Pause/Resume error contract.
+//
+// Thread-safety: acquires the Store's write lock for the duration of
+// the update. Callers MUST NOT hold s.mu when invoking Touch.
+func (s *Store) Touch(name string) (*Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.jobs[name]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	j.LastAttemptTime = Now()
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
+	return j, nil
+}
+
 // persistLocked writes the current in-memory state to
 // "{dataDir}/cloudscheduler/state.json". The caller MUST hold s.mu (write
 // lock) when invoking this helper.

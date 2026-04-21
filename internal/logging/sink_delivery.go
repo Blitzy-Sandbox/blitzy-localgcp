@@ -1,8 +1,12 @@
 // Package logging — sink_delivery.go implements the two fire-and-forget
 // loopback delivery paths used by the WriteLogEntries sink fan-out:
 //
-//   - Pub/Sub: `pubsub.googleapis.com/projects/{p}/topics/{t}` destinations
-//     are routed via a short-lived gRPC client to pubsubAddr.
+//   - Pub/Sub: destinations are routed via a short-lived gRPC client to
+//     pubsubAddr. Two equivalent schemes are accepted:
+//     `pubsub://projects/{p}/topics/{t}` (the canonical short-form
+//     specified by AAP §0.1.1) and
+//     `pubsub.googleapis.com/projects/{p}/topics/{t}` (the long-form that
+//     matches real Cloud Logging sink URIs).
 //   - GCS: `storage.googleapis.com/{bucket}` destinations are routed via a
 //     short-lived HTTP POST (simple-upload) to gcsAddr.
 //
@@ -18,10 +22,10 @@ package logging
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -39,11 +43,21 @@ import (
 // bounded timeout prevents hung peers from leaking goroutines.
 const deliveryTimeout = 5 * time.Second
 
-// pubsubDestinationPrefix identifies Pub/Sub sink destinations. Any Sink
-// with Destination beginning with this prefix is routed through the Pub/Sub
-// loopback gRPC client. The suffix is expected to be of the form
-// "projects/{project}/topics/{topic}".
+// pubsubDestinationPrefix identifies Pub/Sub sink destinations in their
+// real-Cloud-Logging long form. Any Sink whose Destination begins with
+// this prefix is routed through the Pub/Sub loopback gRPC client. The
+// suffix is expected to be of the form "projects/{project}/topics/{topic}".
 const pubsubDestinationPrefix = "pubsub.googleapis.com/"
+
+// pubsubShortScheme identifies Pub/Sub sink destinations in the canonical
+// short form specified by AAP §0.1.1. Any Sink whose Destination begins
+// with this scheme is routed through the Pub/Sub loopback gRPC client.
+// The suffix is expected to be of the form
+// "projects/{project}/topics/{topic}". This form is semantically
+// equivalent to pubsubDestinationPrefix; both are accepted so that
+// emulator users can write either the short URI (per the AAP spec) or
+// the long-form URI (matching real sink destinations).
+const pubsubShortScheme = "pubsub://"
 
 // gcsDestinationPrefix identifies Cloud Storage sink destinations. Any Sink
 // with Destination beginning with this prefix is routed through the GCS
@@ -52,15 +66,19 @@ const pubsubDestinationPrefix = "pubsub.googleapis.com/"
 // objects with timestamp-keyed names.
 const gcsDestinationPrefix = "storage.googleapis.com/"
 
-// parsePubsubDestination strips the pubsub.googleapis.com/ prefix and
-// returns the canonical topic resource name "projects/.../topics/...".
-// Returns empty string if the destination does not match the expected
-// shape.
+// parsePubsubDestination strips the Pub/Sub destination prefix (either
+// the canonical pubsub:// short scheme or the pubsub.googleapis.com/
+// long-form) and returns the canonical topic resource name
+// "projects/.../topics/...". Returns empty string if the destination
+// does not match either expected form.
 func parsePubsubDestination(dest string) string {
-	if !strings.HasPrefix(dest, pubsubDestinationPrefix) {
-		return ""
+	if strings.HasPrefix(dest, pubsubShortScheme) {
+		return strings.TrimPrefix(dest, pubsubShortScheme)
 	}
-	return strings.TrimPrefix(dest, pubsubDestinationPrefix)
+	if strings.HasPrefix(dest, pubsubDestinationPrefix) {
+		return strings.TrimPrefix(dest, pubsubDestinationPrefix)
+	}
+	return ""
 }
 
 // parseGcsDestination strips the storage.googleapis.com/ prefix and
@@ -176,14 +194,21 @@ func uploadEntryToGcs(gcsAddr string, sink Sink, entry *loggingpb.LogEntry) erro
 	)
 
 	// GCS simple-upload URL: POST /upload/storage/v1/b/{bucket}/o?uploadType=media&name=...
-	url := fmt.Sprintf("http://%s/upload/storage/v1/b/%s/o?uploadType=media&name=%s",
-		gcsAddr, bucket, objectName,
+	//
+	// Both the bucket path segment and the object name query parameter are
+	// escaped to survive arbitrary characters in sink destinations and
+	// insert IDs (forward slashes in objectName, reserved URL characters
+	// in bucket names). PathEscape preserves forward slashes in query
+	// values where appropriate; QueryEscape is used for the "name"
+	// parameter because that is a query parameter, not a path segment.
+	reqURL := fmt.Sprintf("http://%s/upload/storage/v1/b/%s/o?uploadType=media&name=%s",
+		gcsAddr, url.PathEscape(bucket), url.QueryEscape(objectName),
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), deliveryTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
@@ -214,7 +239,8 @@ func uploadEntryToGcs(gcsAddr string, sink Sink, entry *loggingpb.LogEntry) erro
 func deliverToSink(pubsubAddr, gcsAddr string, sink Sink, entry *loggingpb.LogEntry) {
 	var err error
 	switch {
-	case strings.HasPrefix(sink.Destination, pubsubDestinationPrefix):
+	case strings.HasPrefix(sink.Destination, pubsubShortScheme),
+		strings.HasPrefix(sink.Destination, pubsubDestinationPrefix):
 		err = publishEntryToPubsub(pubsubAddr, sink, entry)
 	case strings.HasPrefix(sink.Destination, gcsDestinationPrefix):
 		err = uploadEntryToGcs(gcsAddr, sink, entry)
@@ -228,10 +254,4 @@ func deliverToSink(pubsubAddr, gcsAddr string, sink Sink, entry *loggingpb.LogEn
 			sink.Name, sink.Destination, err,
 		)
 	}
-}
-
-// jsonMarshal is a helper that produces canonical JSON for a generic
-// Go value. Used by tests; keeps dependency surface explicit.
-func jsonMarshal(v any) ([]byte, error) {
-	return json.Marshal(v)
 }
