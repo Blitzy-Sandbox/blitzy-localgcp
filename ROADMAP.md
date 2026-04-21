@@ -43,7 +43,7 @@ Fill the gaps that matter most for real-world adoption.
 
 - [x] Cloud KMS (encrypt/decrypt, sign/verify, MAC, key management)
 - [x] Cloud Logging (log ingestion, query, filtering, delete)
-- [x] Cloud Logging log sinks (pubsub:// and storage.googleapis.com/ destinations, fire-and-forget fan-out)
+- [x] Cloud Logging log sinks (pubsub.googleapis.com/ and storage.googleapis.com/ destinations, fire-and-forget fan-out)
 - [x] Cloud Run (service CRUD with immediate operations)
 - [x] Cloud Run container execution (lazy Docker start on first request, per-service reverse proxy, 8200–8299 port pool)
 - [x] Cloud Scheduler (cron job CRUD, robfig/cron/v3 runner, HTTP and Pub/Sub target dispatch)
@@ -65,6 +65,7 @@ Containers start on first connection, not at startup. Opt-in via `--services` fl
 - [x] Bigtable (google/cloud-sdk:emulators, gRPC :9094)
 - [x] Cloud SQL (postgres:16-alpine, TCP :5432)
 - [x] Memorystore (redis:7-alpine, TCP :6379)
+- [x] BigQuery (ghcr.io/goccy/bigquery-emulator / LocalBQ, REST :9060)
 - [x] `localgcp pull` command (pre-fetch images)
 - [x] Data persistence for orchestrated containers (Cloud SQL, Memorystore volume mounts)
 
@@ -84,4 +85,3 @@ Containers start on first connection, not at startup. Opt-in via `--services` fl
 - Multi-language SDK integration tests (Python, Java, Node.js)
 - Cloud Functions v2 (container-based executor)
 - Daemon mode (`localgcp up -d`)
-- BigQuery emulator (orchestrated via goccy/bigquery-emulator, or native with DuckDB)

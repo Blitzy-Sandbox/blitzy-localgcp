@@ -41,6 +41,31 @@ type Object struct {
 	Crc32c          string `json:"crc32c"`
 	Etag            string `json:"etag"`
 	ContentEncoding string `json:"contentEncoding,omitempty"`
+	SelfLink        string `json:"selfLink,omitempty"`
+}
+
+// NotificationConfig is a Cloud Storage notification configuration that
+// routes object events to a Pub/Sub topic. See AAP Extension B.
+//
+// The Topic field is a full resource name in the form
+// `projects/{project}/topics/{topic}` — the format produced by the
+// Cloud Storage API when using the JSON representation.
+type NotificationConfig struct {
+	Kind             string            `json:"kind"`             // "storage#notification"
+	ID               string            `json:"id"`               // per-bucket unique id
+	Topic            string            `json:"topic"`            // projects/{p}/topics/{t}
+	PayloadFormat    string            `json:"payload_format"`   // JSON_API_V1 | NONE
+	EventTypes       []string          `json:"event_types,omitempty"`
+	CustomAttributes map[string]string `json:"custom_attributes,omitempty"`
+	ObjectNamePrefix string            `json:"object_name_prefix,omitempty"`
+	Etag             string            `json:"etag,omitempty"`
+	SelfLink         string            `json:"selfLink,omitempty"`
+}
+
+// NotificationList is the response for ListNotifications.
+type NotificationList struct {
+	Kind  string               `json:"kind"` // "storage#notifications"
+	Items []NotificationConfig `json:"items"`
 }
 
 // BucketList is the response for listing buckets.
@@ -61,6 +86,14 @@ type Store struct {
 	mu      sync.RWMutex
 	buckets map[string]*Bucket
 	objects map[string]map[string]*storedObject // bucket -> object name -> object
+
+	// notifications is the per-bucket notification-config registry used
+	// by GCS→Pub/Sub fan-out. Keyed by bucket name then by config id.
+	notifications map[string]map[string]*NotificationConfig
+
+	// notifCounter generates per-store unique notification config ids.
+	notifCounter uint64
+
 	dataDir string
 }
 
@@ -73,9 +106,10 @@ type storedObject struct {
 // persisted state and flushes on writes.
 func NewStore(dataDir string) *Store {
 	s := &Store{
-		buckets: make(map[string]*Bucket),
-		objects: make(map[string]map[string]*storedObject),
-		dataDir: dataDir,
+		buckets:       make(map[string]*Bucket),
+		objects:       make(map[string]map[string]*storedObject),
+		notifications: make(map[string]map[string]*NotificationConfig),
+		dataDir:       dataDir,
 	}
 	if dataDir != "" {
 		s.load()
@@ -106,6 +140,7 @@ func (s *Store) CreateBucket(name, project string) (*Bucket, error) {
 	}
 	s.buckets[name] = b
 	s.objects[name] = make(map[string]*storedObject)
+	s.notifications[name] = make(map[string]*NotificationConfig)
 	s.persist()
 	return b, nil
 }
@@ -142,8 +177,115 @@ func (s *Store) DeleteBucket(name string) error {
 
 	delete(s.buckets, name)
 	delete(s.objects, name)
+	delete(s.notifications, name)
 	s.persist()
 	return nil
+}
+
+// --- Notification configuration operations ---
+//
+// NotificationConfigs are scoped to a bucket and identified by a
+// per-bucket integer id encoded as a string. Create returns the
+// populated config with ID set; the other methods are standard
+// get/list/delete semantics.
+
+// CreateNotification registers a new notification configuration for
+// `bucket`. Returns a populated copy (Kind, ID, Etag, SelfLink) or an
+// error if the bucket does not exist.
+func (s *Store) CreateNotification(bucket string, cfg NotificationConfig) (*NotificationConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.buckets[bucket]; !exists {
+		return nil, fmt.Errorf("not found: bucket %q", bucket)
+	}
+	if _, ok := s.notifications[bucket]; !ok {
+		s.notifications[bucket] = make(map[string]*NotificationConfig)
+	}
+	s.notifCounter++
+	cfg.ID = fmt.Sprintf("%d", s.notifCounter)
+	cfg.Kind = "storage#notification"
+	cfg.Etag = generateEtag()
+	cfg.SelfLink = fmt.Sprintf("https://storage.googleapis.com/storage/v1/b/%s/notificationConfigs/%s", bucket, cfg.ID)
+	if cfg.PayloadFormat == "" {
+		cfg.PayloadFormat = "JSON_API_V1"
+	}
+	if len(cfg.EventTypes) == 0 {
+		// Empty means "all event types" per GCS convention. Callers that
+		// want an explicit subset may specify OBJECT_FINALIZE / OBJECT_DELETE.
+		cfg.EventTypes = nil
+	}
+	stored := cfg
+	s.notifications[bucket][cfg.ID] = &stored
+	s.persist()
+	return &stored, nil
+}
+
+// GetNotification returns the notification config with the given id,
+// or (nil, false) if no such config exists.
+func (s *Store) GetNotification(bucket, id string) (*NotificationConfig, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	byID, ok := s.notifications[bucket]
+	if !ok {
+		return nil, false
+	}
+	c, ok := byID[id]
+	if !ok {
+		return nil, false
+	}
+	// Return a defensive copy so callers cannot mutate store state.
+	copied := *c
+	return &copied, true
+}
+
+// ListNotifications returns all configs for the bucket, sorted by id.
+// Returns nil (empty list) if the bucket does not exist or has no
+// configs. The second return value is true when the bucket itself
+// exists (so callers can distinguish "no configs" from "no bucket").
+func (s *Store) ListNotifications(bucket string) ([]NotificationConfig, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, exists := s.buckets[bucket]; !exists {
+		return nil, false
+	}
+	byID := s.notifications[bucket]
+	out := make([]NotificationConfig, 0, len(byID))
+	for _, c := range byID {
+		out = append(out, *c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, true
+}
+
+// DeleteNotification removes the named config. Returns an error if the
+// config does not exist.
+func (s *Store) DeleteNotification(bucket, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	byID, ok := s.notifications[bucket]
+	if !ok {
+		return fmt.Errorf("not found: bucket %q", bucket)
+	}
+	if _, ok := byID[id]; !ok {
+		return fmt.Errorf("not found: notification %q in bucket %q", id, bucket)
+	}
+	delete(byID, id)
+	s.persist()
+	return nil
+}
+
+// NotificationsForBucket returns a snapshot copy of the configs for
+// the bucket. Used by the fan-out path to avoid holding the store
+// lock while publishing to Pub/Sub.
+func (s *Store) NotificationsForBucket(bucket string) []NotificationConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	byID := s.notifications[bucket]
+	out := make([]NotificationConfig, 0, len(byID))
+	for _, c := range byID {
+		out = append(out, *c)
+	}
+	return out
 }
 
 // --- Object operations ---
@@ -300,8 +442,10 @@ func (s *Store) ListObjects(bucket, prefix, delimiter string, maxResults int) ([
 // --- Persistence ---
 
 type persistedState struct {
-	Buckets []Bucket                   `json:"buckets"`
-	Objects map[string][]persistedObj  `json:"objects"`
+	Buckets       []Bucket                          `json:"buckets"`
+	Objects       map[string][]persistedObj         `json:"objects"`
+	Notifications map[string][]NotificationConfig   `json:"notifications,omitempty"`
+	NotifCounter  uint64                            `json:"notifCounter,omitempty"`
 }
 
 type persistedObj struct {
@@ -318,8 +462,10 @@ func (s *Store) persist() {
 	os.MkdirAll(dir, 0o755)
 
 	state := persistedState{
-		Buckets: make([]Bucket, 0, len(s.buckets)),
-		Objects: make(map[string][]persistedObj),
+		Buckets:       make([]Bucket, 0, len(s.buckets)),
+		Objects:       make(map[string][]persistedObj),
+		Notifications: make(map[string][]NotificationConfig),
+		NotifCounter:  s.notifCounter,
 	}
 
 	for _, b := range s.buckets {
@@ -335,6 +481,14 @@ func (s *Store) persist() {
 			})
 		}
 		state.Objects[bucket] = pObjs
+	}
+
+	for bucket, notifs := range s.notifications {
+		list := make([]NotificationConfig, 0, len(notifs))
+		for _, n := range notifs {
+			list = append(list, *n)
+		}
+		state.Notifications[bucket] = list
 	}
 
 	data, _ := json.MarshalIndent(state, "", "  ")
@@ -373,6 +527,27 @@ func (s *Store) load() {
 			}
 			s.objects[bucket][po.Meta.Name] = &storedObject{Meta: po.Meta, Content: content}
 		}
+	}
+
+	// Restore notification configs. A bucket that lost its notifications map on
+	// load (e.g., because an older state.json omitted the field) gets an empty
+	// map so subsequent CreateNotification calls succeed.
+	for bucket := range s.buckets {
+		if _, ok := s.notifications[bucket]; !ok {
+			s.notifications[bucket] = make(map[string]*NotificationConfig)
+		}
+	}
+	for bucket, notifs := range state.Notifications {
+		if _, ok := s.notifications[bucket]; !ok {
+			s.notifications[bucket] = make(map[string]*NotificationConfig)
+		}
+		for i := range notifs {
+			n := notifs[i]
+			s.notifications[bucket][n.ID] = &n
+		}
+	}
+	if state.NotifCounter > s.notifCounter {
+		s.notifCounter = state.NotifCounter
 	}
 }
 

@@ -223,7 +223,7 @@ Your GCP client libraries work against localgcp with zero code changes (except S
 - List distinct log names
 - Delete logs by name
 - **Log sinks**: `CreateSink` / `GetSink` / `UpdateSink` / `DeleteSink` / `ListSinks`
-- Sink destinations: `pubsub://projects/{project}/topics/{topic}` (loopback Pub/Sub) and `storage.googleapis.com/{bucket}` (loopback GCS)
+- Sink destinations: `pubsub.googleapis.com/projects/{project}/topics/{topic}` (loopback Pub/Sub) and `storage.googleapis.com/{bucket}` (loopback GCS)
 - Fire-and-forget fan-out on `WriteLogEntries` — delivery failures logged to stderr only
 
 ### Cloud Run
@@ -269,12 +269,13 @@ localgcp --version         Print version
 | `--vertex-model-map` | (defaults) | Model aliases (e.g. `gemini-2.5-flash=llama3.2`) |
 | `--vertex-backend` | `ollama` | Backend provider: `ollama`, `openai`, `anthropic`, `stub` |
 | `--vertex-api-key` | | API key for OpenAI/Anthropic backends |
-| `--services` | | Docker-orchestrated services: `spanner,bigtable,cloudsql,memorystore` |
+| `--services` | | Docker-orchestrated services: `spanner,bigtable,cloudsql,memorystore,bigquery` |
 | `--no-docker` | false | Skip all Docker-orchestrated services |
 | `--port-spanner` | 9010 | Spanner emulator port |
 | `--port-bigtable` | 9094 | Bigtable emulator port |
 | `--port-cloudsql` | 5432 | Cloud SQL (Postgres) port |
 | `--port-memorystore` | 6379 | Memorystore (Redis) port |
+| `--port-bigquery` | 9060 | BigQuery (LocalBQ) port |
 | `--quiet`, `-q` | false | Suppress request logging |
 
 ## How it works
@@ -362,12 +363,12 @@ localgcp builds on the shoulders of excellent standalone emulators:
 - [fsouza/fake-gcs-server](https://github.com/fsouza/fake-gcs-server) — GCS emulator with broad API coverage
 - [aertje/cloud-tasks-emulator](https://github.com/aertje/cloud-tasks-emulator) — Cloud Tasks emulator with App Engine support
 
-localgcp's differentiator is the **unified single-binary** approach: one process, fourteen services, zero configuration. If you only need one service and want deeper API coverage, these standalone projects are great choices.
+localgcp's differentiator is the **unified single-binary** approach: one process, fifteen services, zero configuration. If you only need one service and want deeper API coverage, these standalone projects are great choices.
 
 ## FAQ
 
 ### Is there a LocalStack for Google Cloud?
-Yes — localgcp. One open-source Go binary emulating 14 GCP services on localhost. Same idea as LocalStack for AWS, for GCP.
+Yes — localgcp. One open-source Go binary emulating 15 GCP services on localhost. Same idea as LocalStack for AWS, for GCP.
 
 ### How do I run Google Cloud locally?
 `brew install slokam-ai/tap/localgcp && localgcp up && eval $(localgcp env)`. Your existing GCP client libraries talk to localhost with zero code changes.

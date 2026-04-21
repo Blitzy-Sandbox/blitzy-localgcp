@@ -59,15 +59,8 @@
 
 ### ~~Cloud Logging sinks~~ (DONE)
 - Five new sink RPCs: `CreateSink`, `GetSink`, `UpdateSink`, `DeleteSink`, `ListSinks`.
-- Destinations: `pubsub://projects/{project}/topics/{topic}` or `storage.googleapis.com/{bucket}`.
+- Destinations: `pubsub.googleapis.com/projects/{project}/topics/{topic}` or `storage.googleapis.com/{bucket}`.
 - `WriteLogEntries` fans out matching entries to each sink via fire-and-forget goroutine.
 - Delivery failures logged to stderr; `WriteLogEntries` caller never sees sink errors.
 
-## Future Services
 
-### BigQuery emulator (orchestrated)
-- **What:** Add BigQuery as an orchestrated service using [goccy/bigquery-emulator](https://github.com/goccy/bigquery-emulator) Docker image (`ghcr.io/goccy/bigquery-emulator`).
-- **Why:** Frequently requested. BigQuery is one of the most-used GCP services for data engineers.
-- **Context:** The existing emulator uses ZetaSQL (Google's actual SQL parser) + SQLite. REST API on port 9050. Supports `BIGQUERY_EMULATOR_HOST` env var. Just needs a config entry in `internal/orchestrator/config.go`, same pattern as Spanner.
-- **Effort:** ~5 min (config + CLI wiring). No custom implementation needed.
-- **Depends on:** Nothing. Orchestrator framework already supports this.
