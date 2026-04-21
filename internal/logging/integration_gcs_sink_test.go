@@ -239,12 +239,12 @@ func pollGCSObjectsUntilN(t *testing.T, baseURL, bucketName string, want int, ti
 //
 // The fixed timestamp is:
 //
-//     2023-11-14 22:13:20 UTC  →  "2023-11-14"
-//                               →  "20231114T221320.000000000Z"
+//	2023-11-14 22:13:20 UTC  →  "2023-11-14"
+//	                          →  "20231114T221320.000000000Z"
 //
 // so a sink named "happy-sink" with insertId "e-001" yields:
 //
-//     "happy-sink/2023-11-14/20231114T221320.000000000Z-e-001.json"
+//	"happy-sink/2023-11-14/20231114T221320.000000000Z-e-001.json"
 //
 // This function is used only in the deterministic Delivery test; tests that
 // don't care about the exact name use pollGCSObjectsUntilN + ListObjects
@@ -284,12 +284,12 @@ func fetchAndGuard(t *testing.T, baseURL, bucketName, objectName string) []byte 
 // calls WriteLogEntries with one entry carrying a fixed Timestamp and a
 // known InsertId, waits for the fan-out goroutine to upload, then asserts:
 //
-//   (1) The bucket has exactly one object.
-//   (2) The object's Name equals the deterministic expected name derived
-//       from the sink short-name, the fixed timestamp, and the InsertId.
-//   (3) The object's content bytes round-trip back into a *loggingpb.LogEntry
-//       whose LogName, InsertId, Severity, and TextPayload match the entry
-//       that was sent.
+//	(1) The bucket has exactly one object.
+//	(2) The object's Name equals the deterministic expected name derived
+//	    from the sink short-name, the fixed timestamp, and the InsertId.
+//	(3) The object's content bytes round-trip back into a *loggingpb.LogEntry
+//	    whose LogName, InsertId, Severity, and TextPayload match the entry
+//	    that was sent.
 func TestIntegration_Logging_GCSSink_Delivery(t *testing.T) {
 	gcsAddr, baseURL := startGCSForLoggingSink(t)
 	bucket := "happy-bucket"
