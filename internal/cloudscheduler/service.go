@@ -11,6 +11,12 @@
 // Pub/Sub target (via loopback gRPC at pubsubAddr). RunJob performs a
 // single one-shot dispatch WITHOUT mutating schedule or state.
 //
+// Storage is decoupled from the wire format: the in-memory Store holds
+// cloudscheduler.Job records (see store.go) and this file translates at
+// the RPC boundary via jobFromProto / jobToProto. Sentinel errors from the
+// store (ErrNotFound, ErrAlreadyExists) are mapped to gRPC status codes
+// via errors.Is.
+//
 // Out-of-scope RPCs: CloudSchedulerServer has no RPCs outside the in-scope
 // set, so the unimplemented-dispatch pattern required by Rule 6 is not
 // exercised by this service directly (UnimplementedCloudSchedulerServer
@@ -19,6 +25,7 @@ package cloudscheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -71,13 +78,16 @@ type Service struct {
 // the host:port of the loopback Pub/Sub gRPC endpoint (e.g.
 // "localhost:8085"). Callers that do not need PubsubTarget dispatch may pass
 // the empty string and Pub/Sub-target dispatch will silently no-op.
+//
+// dataDir, when non-empty, enables best-effort JSON snapshot persistence of
+// the in-memory job store. See store.go for details.
 func New(dataDir string, quiet bool, pubsubAddr string) *Service {
 	logger := log.New(os.Stderr, "[cloudscheduler] ", log.LstdFlags)
 	return &Service{
 		dataDir:    dataDir,
 		quiet:      quiet,
 		logger:     logger,
-		store:      NewStore(),
+		store:      NewStore(dataDir),
 		pubsubAddr: pubsubAddr,
 		dispatcher: dispatch.New(dispatch.DefaultConfig()),
 		cron:       cron.New(),
@@ -126,6 +136,8 @@ func (s *Service) Start(ctx context.Context, addr string) error {
 
 // CreateJob inserts a job, assigns a name when one is not provided, and
 // registers it with the cron runner if the effective state is ENABLED.
+// State defaults to ENABLED when the caller omits it, matching real
+// Cloud Scheduler semantics.
 func (s *Service) CreateJob(_ context.Context, req *schedulerpb.CreateJobRequest) (*schedulerpb.Job, error) {
 	parent := req.GetParent()
 	if parent == "" {
@@ -152,50 +164,71 @@ func (s *Service) CreateJob(_ context.Context, req *schedulerpb.CreateJobRequest
 		return nil, err
 	}
 
-	created, err := s.store.Create(name, job)
-	if err != nil {
-		return nil, status.Errorf(codes.AlreadyExists, "%v", err)
+	// Convert the wire-format job into the in-memory form and default
+	// State to ENABLED when omitted. UserUpdateTime is stamped server-side.
+	internal := jobFromProto(job)
+	if internal.State == schedulerpb.Job_STATE_UNSPECIFIED {
+		internal.State = schedulerpb.Job_ENABLED
+	}
+	internal.UserUpdateTime = Now()
+
+	if err := s.store.Create(internal); err != nil {
+		if errors.Is(err, ErrAlreadyExists) {
+			return nil, status.Errorf(codes.AlreadyExists, "%v", err)
+		}
+		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 
 	// Register with cron runner if enabled.
-	if created.GetState() == schedulerpb.Job_ENABLED {
-		if err := s.scheduleJob(created); err != nil {
+	if internal.State == schedulerpb.Job_ENABLED {
+		if err := s.scheduleJob(internal); err != nil {
 			// Roll back on schedule-parse failure so the store does not
 			// carry a zombie entry.
 			_ = s.store.Delete(name)
-			return nil, status.Errorf(codes.InvalidArgument, "invalid schedule %q: %v", created.GetSchedule(), err)
+			return nil, status.Errorf(codes.InvalidArgument, "invalid schedule %q: %v", internal.Schedule, err)
 		}
 	}
-	return created, nil
+	return jobToProto(internal), nil
 }
 
 // GetJob returns an existing job.
 func (s *Service) GetJob(_ context.Context, req *schedulerpb.GetJobRequest) (*schedulerpb.Job, error) {
-	job, ok := s.store.Get(req.GetName())
-	if !ok {
-		return nil, status.Errorf(codes.NotFound, "job %s not found", req.GetName())
+	j, err := s.store.Get(req.GetName())
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, status.Errorf(codes.NotFound, "job %s not found", req.GetName())
+		}
+		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	return job, nil
+	return jobToProto(j), nil
 }
 
-// ListJobs returns all jobs under a parent.
+// ListJobs returns all jobs under a parent, deterministically sorted by name.
 func (s *Service) ListJobs(_ context.Context, req *schedulerpb.ListJobsRequest) (*schedulerpb.ListJobsResponse, error) {
 	jobs := s.store.List(req.GetParent())
-	return &schedulerpb.ListJobsResponse{Jobs: jobs}, nil
+	out := make([]*schedulerpb.Job, 0, len(jobs))
+	for _, j := range jobs {
+		out = append(out, jobToProto(j))
+	}
+	return &schedulerpb.ListJobsResponse{Jobs: out}, nil
 }
 
 // DeleteJob removes a job from both the store and the cron runner.
 func (s *Service) DeleteJob(_ context.Context, req *schedulerpb.DeleteJobRequest) (*emptypb.Empty, error) {
 	name := req.GetName()
-	if !s.store.Delete(name) {
-		return nil, status.Errorf(codes.NotFound, "job %s not found", name)
+	if err := s.store.Delete(name); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, status.Errorf(codes.NotFound, "job %s not found", name)
+		}
+		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 	s.unscheduleJob(name)
 	return &emptypb.Empty{}, nil
 }
 
 // UpdateJob replaces an existing job's mutable fields. The job is unscheduled
-// and re-scheduled based on its resulting state/schedule.
+// and re-scheduled based on its resulting state/schedule. UserUpdateTime is
+// refreshed to the current wall-clock time.
 func (s *Service) UpdateJob(_ context.Context, req *schedulerpb.UpdateJobRequest) (*schedulerpb.Job, error) {
 	in := req.GetJob()
 	if in == nil {
@@ -208,90 +241,122 @@ func (s *Service) UpdateJob(_ context.Context, req *schedulerpb.UpdateJobRequest
 		return nil, err
 	}
 
-	updated, err := s.store.Update(in.GetName(), in)
-	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "%v", err)
+	internal := jobFromProto(in)
+	if internal.State == schedulerpb.Job_STATE_UNSPECIFIED {
+		internal.State = schedulerpb.Job_ENABLED
+	}
+	internal.UserUpdateTime = Now()
+
+	if err := s.store.Update(internal); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, status.Errorf(codes.NotFound, "%v", err)
+		}
+		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 
 	// Always re-schedule — cron expression or target may have changed.
-	s.unscheduleJob(updated.GetName())
-	if updated.GetState() == schedulerpb.Job_ENABLED {
-		if err := s.scheduleJob(updated); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "invalid schedule %q: %v", updated.GetSchedule(), err)
+	s.unscheduleJob(internal.Name)
+	if internal.State == schedulerpb.Job_ENABLED {
+		if err := s.scheduleJob(internal); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid schedule %q: %v", internal.Schedule, err)
 		}
 	}
-	return updated, nil
+	return jobToProto(internal), nil
 }
 
 // RunJob performs an immediate, one-shot dispatch of the job's target without
 // mutating the job's schedule or state. This is the manual "run now" button.
-func (s *Service) RunJob(ctx context.Context, req *schedulerpb.RunJobRequest) (*schedulerpb.Job, error) {
-	job, ok := s.store.Get(req.GetName())
-	if !ok {
-		return nil, status.Errorf(codes.NotFound, "job %s not found", req.GetName())
+// Only LastAttemptTime is updated to reflect that a dispatch was requested.
+func (s *Service) RunJob(_ context.Context, req *schedulerpb.RunJobRequest) (*schedulerpb.Job, error) {
+	j, err := s.store.Get(req.GetName())
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, status.Errorf(codes.NotFound, "job %s not found", req.GetName())
+		}
+		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 
 	// Dispatch is fire-and-forget per Rule 3 — the RPC returns before the
 	// downstream call completes.
-	go s.dispatchOnce(job)
-	// Update timestamps only, not schedule or state.
-	s.store.TouchRun(job.GetName())
-	// Re-read so the timestamps are fresh.
-	out, _ := s.store.Get(req.GetName())
-	if out == nil {
-		return job, nil
+	go s.dispatchOnce(j)
+
+	// Update timestamps only — schedule and state MUST remain untouched
+	// per AAP §0.1.1 Extension C. We construct a shallow copy so we are
+	// not racing with concurrent readers holding the aliased pointer.
+	cp := *j
+	cp.LastAttemptTime = Now()
+	if err := s.store.Update(&cp); err != nil {
+		// Persistence failure: return the pre-touch snapshot rather than a
+		// 5xx. The dispatch goroutine is already in flight.
+		return jobToProto(j), nil
 	}
-	return out, nil
+
+	// Re-read so the returned proto reflects any concurrent mutations.
+	out, err := s.store.Get(req.GetName())
+	if err != nil {
+		return jobToProto(&cp), nil
+	}
+	return jobToProto(out), nil
 }
 
 // PauseJob transitions a job to PAUSED and unschedules it.
 func (s *Service) PauseJob(_ context.Context, req *schedulerpb.PauseJobRequest) (*schedulerpb.Job, error) {
-	job, err := s.store.SetState(req.GetName(), schedulerpb.Job_PAUSED)
+	j, err := s.store.Pause(req.GetName())
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "%v", err)
+		if errors.Is(err, ErrNotFound) {
+			return nil, status.Errorf(codes.NotFound, "%v", err)
+		}
+		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 	s.unscheduleJob(req.GetName())
-	return job, nil
+	return jobToProto(j), nil
 }
 
 // ResumeJob transitions a job to ENABLED and re-schedules it.
 func (s *Service) ResumeJob(_ context.Context, req *schedulerpb.ResumeJobRequest) (*schedulerpb.Job, error) {
-	job, err := s.store.SetState(req.GetName(), schedulerpb.Job_ENABLED)
+	j, err := s.store.Resume(req.GetName())
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "%v", err)
+		if errors.Is(err, ErrNotFound) {
+			return nil, status.Errorf(codes.NotFound, "%v", err)
+		}
+		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 	// Ensure we do not stack duplicate entries if Resume is called twice.
 	s.unscheduleJob(req.GetName())
-	if err := s.scheduleJob(job); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid schedule %q: %v", job.GetSchedule(), err)
+	if err := s.scheduleJob(j); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid schedule %q: %v", j.Schedule, err)
 	}
-	return job, nil
+	return jobToProto(j), nil
 }
 
 // --- Cron runner wiring ---
 
 // scheduleJob parses the job's cron expression and installs a tick entry that
 // dispatches once per firing. Callers must hold no locks on the store.
-func (s *Service) scheduleJob(job *schedulerpb.Job) error {
-	spec := job.GetSchedule()
+func (s *Service) scheduleJob(job *Job) error {
+	spec := job.Schedule
 	if spec == "" {
 		// Cloud Scheduler allows jobs without a schedule (manual-only); we
 		// accept this and simply do not register a tick entry.
 		return nil
 	}
 
-	name := job.GetName()
+	name := job.Name
 	id, err := s.cron.AddFunc(spec, func() {
 		// Re-fetch inside the tick so the latest target/state wins.
-		current, ok := s.store.Get(name)
-		if !ok {
+		current, err := s.store.Get(name)
+		if err != nil {
+			// Job was deleted between scheduling and firing; swallow.
 			return
 		}
-		if current.GetState() != schedulerpb.Job_ENABLED {
+		if current.State != schedulerpb.Job_ENABLED {
 			return
 		}
 		s.dispatchOnce(current)
-		s.store.TouchRun(name)
+		// Touch LastAttemptTime. Copy to avoid aliasing with in-map state.
+		cp := *current
+		cp.LastAttemptTime = Now()
+		_ = s.store.Update(&cp)
 	})
 	if err != nil {
 		return err
@@ -322,25 +387,24 @@ func (s *Service) unscheduleJob(name string) {
 // dispatchOnce performs a single delivery attempt for the job's target. All
 // errors are logged to stderr and never returned — the caller's goroutine is
 // transient (Rule 3).
-func (s *Service) dispatchOnce(job *schedulerpb.Job) {
-	switch t := job.GetTarget().(type) {
-	case *schedulerpb.Job_HttpTarget:
-		s.dispatchHTTP(job, t.HttpTarget)
-	case *schedulerpb.Job_PubsubTarget:
-		s.dispatchPubsub(job, t.PubsubTarget)
-	case *schedulerpb.Job_AppEngineHttpTarget:
-		// AppEngineHttpTarget is explicitly out of scope (AAP §0.6.2). We
-		// log a single line to stderr so debugging is not silent.
-		s.logger.Printf("job %s has AppEngineHttpTarget which is not supported", job.GetName())
+func (s *Service) dispatchOnce(job *Job) {
+	switch {
+	case job.HTTPTarget != nil:
+		s.dispatchHTTP(job, job.HTTPTarget)
+	case job.PubsubTarget != nil:
+		s.dispatchPubsub(job, job.PubsubTarget)
 	default:
-		s.logger.Printf("job %s has no recognised target", job.GetName())
+		// AppEngineHttpTarget is explicitly out of scope (AAP §0.6.2) and
+		// is not preserved on the internal Job; jobs created with that
+		// target land here with no recognised target.
+		s.logger.Printf("job %s has no recognised target", job.Name)
 	}
 }
 
 // dispatchHTTP delivers an HttpTarget via the shared dispatcher. The
 // dispatcher is HTTP POST-only; honouring HttpMethod enum values other than
 // POST is out of scope (AAP §0.6.2).
-func (s *Service) dispatchHTTP(job *schedulerpb.Job, t *schedulerpb.HttpTarget) {
+func (s *Service) dispatchHTTP(job *Job, t *schedulerpb.HttpTarget) {
 	if t == nil || t.GetUri() == "" {
 		return
 	}
@@ -351,13 +415,13 @@ func (s *Service) dispatchHTTP(job *schedulerpb.Job, t *schedulerpb.HttpTarget) 
 	res := s.dispatcher.Dispatch(context.Background(), t.GetUri(), t.GetBody(), headers)
 	if res.Err != nil {
 		fmt.Fprintf(os.Stderr, "[cloudscheduler] http dispatch %s: %v (attempts=%d status=%d)\n",
-			job.GetName(), res.Err, res.Attempts, res.StatusCode)
+			job.Name, res.Err, res.Attempts, res.StatusCode)
 	}
 }
 
 // dispatchPubsub publishes a PubsubTarget via loopback gRPC. When pubsubAddr
 // is empty the publish is silently skipped.
-func (s *Service) dispatchPubsub(job *schedulerpb.Job, t *schedulerpb.PubsubTarget) {
+func (s *Service) dispatchPubsub(job *Job, t *schedulerpb.PubsubTarget) {
 	if t == nil || t.GetTopicName() == "" {
 		return
 	}
@@ -365,7 +429,7 @@ func (s *Service) dispatchPubsub(job *schedulerpb.Job, t *schedulerpb.PubsubTarg
 		return
 	}
 	if err := publishToPubsub(s.pubsubAddr, t.GetTopicName(), t.GetData(), t.GetAttributes()); err != nil {
-		fmt.Fprintf(os.Stderr, "[cloudscheduler] pubsub dispatch %s: %v\n", job.GetName(), err)
+		fmt.Fprintf(os.Stderr, "[cloudscheduler] pubsub dispatch %s: %v\n", job.Name, err)
 	}
 }
 
@@ -424,9 +488,77 @@ func (s *Service) loggingInterceptor(ctx context.Context, req interface{}, info 
 	return resp, err
 }
 
-// Now is a test seam for TouchRun time overrides.
+// Now is a test seam for LastAttemptTime / UserUpdateTime time overrides.
 var Now = time.Now
 
-// ensure timestamppb is used (the store.go file consumes it; this keeps the
-// linter quiet in case imports drift).
-var _ = (*timestamppb.Timestamp)(nil)
+// --- Wire <-> in-memory conversions ---
+
+// jobFromProto converts a wire-format *schedulerpb.Job to an internal *Job
+// suitable for storage. Called at RPC entry points (CreateJob, UpdateJob)
+// where the request carries a proto representation.
+//
+// Note: AppEngineHttpTarget is explicitly out of scope (AAP §0.6.2) and the
+// internal Job struct has no field for it; jobs created with an AppEngine
+// target pass validation but their target payload is discarded on
+// conversion. This matches the dispatch-time behaviour where such targets
+// would have produced a "not supported" log entry anyway.
+func jobFromProto(p *schedulerpb.Job) *Job {
+	if p == nil {
+		return nil
+	}
+	j := &Job{
+		Name:         p.GetName(),
+		Description:  p.GetDescription(),
+		Schedule:     p.GetSchedule(),
+		TimeZone:     p.GetTimeZone(),
+		State:        p.GetState(),
+		HTTPTarget:   p.GetHttpTarget(),
+		PubsubTarget: p.GetPubsubTarget(),
+	}
+	if t := p.GetUserUpdateTime(); t != nil {
+		j.UserUpdateTime = t.AsTime()
+	}
+	if t := p.GetLastAttemptTime(); t != nil {
+		j.LastAttemptTime = t.AsTime()
+	}
+	if t := p.GetScheduleTime(); t != nil {
+		j.ScheduleTime = t.AsTime()
+	}
+	return j
+}
+
+// jobToProto converts an internal *Job to a wire-format *schedulerpb.Job.
+// Called at RPC exit points (every response that returns a Job). Zero-value
+// time.Time fields are elided so the wire does not carry meaningless
+// Unix-epoch timestamps on freshly-created jobs.
+func jobToProto(j *Job) *schedulerpb.Job {
+	if j == nil {
+		return nil
+	}
+	p := &schedulerpb.Job{
+		Name:        j.Name,
+		Description: j.Description,
+		Schedule:    j.Schedule,
+		TimeZone:    j.TimeZone,
+		State:       j.State,
+	}
+	// The schedulerpb.Job.Target oneof accepts exactly one of HttpTarget,
+	// PubsubTarget, or AppEngineHttpTarget. We populate whichever the
+	// internal record carries; if both happen to be set (a caller-provided
+	// contract violation) HTTPTarget wins deterministically.
+	if j.HTTPTarget != nil {
+		p.Target = &schedulerpb.Job_HttpTarget{HttpTarget: j.HTTPTarget}
+	} else if j.PubsubTarget != nil {
+		p.Target = &schedulerpb.Job_PubsubTarget{PubsubTarget: j.PubsubTarget}
+	}
+	if !j.UserUpdateTime.IsZero() {
+		p.UserUpdateTime = timestamppb.New(j.UserUpdateTime)
+	}
+	if !j.LastAttemptTime.IsZero() {
+		p.LastAttemptTime = timestamppb.New(j.LastAttemptTime)
+	}
+	if !j.ScheduleTime.IsZero() {
+		p.ScheduleTime = timestamppb.New(j.ScheduleTime)
+	}
+	return p
+}

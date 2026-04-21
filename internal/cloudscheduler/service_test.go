@@ -18,6 +18,7 @@ package cloudscheduler
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	schedulerpb "cloud.google.com/go/scheduler/apiv1/schedulerpb"
@@ -425,30 +426,135 @@ func TestRunJob_NotFound(t *testing.T) {
 
 // --- Store semantics (defence-in-depth against accidental state.SetState
 // regressions). ---
+//
+// These tests exercise the store layer directly — they construct Store
+// instances with NewStore("") so persistence is disabled and the tests
+// remain hermetic. They complement the service-level RPC tests by pinning
+// down the sentinel-error contract (ErrNotFound, ErrAlreadyExists), the
+// deterministic List ordering, and the state-preservation semantics
+// relied on by service.go.
 
-func TestStore_CreateSetsEnabledByDefault(t *testing.T) {
-	s := NewStore()
-	j := &schedulerpb.Job{}
-	out, err := s.Create(jobName("s1"), j)
-	if err != nil {
+// TestStore_CreatePreservesState asserts that the store writes and returns
+// whatever State the caller set. The "default to ENABLED on create" policy
+// lives in the service layer (CreateJob) — see TestCreateJob_HttpTarget_RoundTrip
+// for the service-level coverage of that default.
+func TestStore_CreatePreservesState(t *testing.T) {
+	s := NewStore("")
+	j := &Job{Name: jobName("s1"), State: schedulerpb.Job_ENABLED}
+	if err := s.Create(j); err != nil {
 		t.Fatal(err)
 	}
-	if out.GetState() != schedulerpb.Job_ENABLED {
-		t.Errorf("default State = %v, want ENABLED", out.GetState())
+	got, err := s.Get(jobName("s1"))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != schedulerpb.Job_ENABLED {
+		t.Errorf("State = %v, want ENABLED", got.State)
 	}
 }
 
+// TestStore_CreateDuplicateReturnsAlreadyExists pins down the sentinel
+// error contract the service layer relies on for codes.AlreadyExists mapping.
+func TestStore_CreateDuplicateReturnsAlreadyExists(t *testing.T) {
+	s := NewStore("")
+	if err := s.Create(&Job{Name: jobName("dup")}); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	err := s.Create(&Job{Name: jobName("dup")})
+	if err == nil {
+		t.Fatalf("second Create did not return error")
+	}
+	if !errors.Is(err, ErrAlreadyExists) {
+		t.Errorf("err = %v, want ErrAlreadyExists", err)
+	}
+}
+
+// TestStore_UpdateNotFound pins down the sentinel error contract the
+// service layer relies on for codes.NotFound mapping on Update.
 func TestStore_UpdateNotFound(t *testing.T) {
-	s := NewStore()
-	if _, err := s.Update(jobName("ghost"), &schedulerpb.Job{}); err == nil {
-		t.Errorf("Update of missing job did not error")
+	s := NewStore("")
+	err := s.Update(&Job{Name: jobName("ghost")})
+	if err == nil {
+		t.Fatalf("Update of missing job did not error")
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }
 
+// TestStore_DeleteNotFound pins down the sentinel error contract for
+// Delete. The service layer maps this to codes.NotFound.
+func TestStore_DeleteNotFound(t *testing.T) {
+	s := NewStore("")
+	err := s.Delete(jobName("ghost"))
+	if err == nil {
+		t.Fatalf("Delete of missing job did not error")
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestStore_GetNotFound pins down the sentinel error contract for Get.
+func TestStore_GetNotFound(t *testing.T) {
+	s := NewStore("")
+	_, err := s.Get(jobName("ghost"))
+	if err == nil {
+		t.Fatalf("Get of missing job did not error")
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestStore_PauseResumeStateTransitions exercises the PAUSED <-> ENABLED
+// state machine at the store layer.
+func TestStore_PauseResumeStateTransitions(t *testing.T) {
+	s := NewStore("")
+	if err := s.Create(&Job{Name: jobName("p1"), State: schedulerpb.Job_ENABLED}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	paused, err := s.Pause(jobName("p1"))
+	if err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if paused.State != schedulerpb.Job_PAUSED {
+		t.Errorf("after Pause: State = %v, want PAUSED", paused.State)
+	}
+	resumed, err := s.Resume(jobName("p1"))
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if resumed.State != schedulerpb.Job_ENABLED {
+		t.Errorf("after Resume: State = %v, want ENABLED", resumed.State)
+	}
+}
+
+// TestStore_PauseNotFound / TestStore_ResumeNotFound pin down the
+// ErrNotFound sentinel for the state-machine RPCs.
+func TestStore_PauseNotFound(t *testing.T) {
+	s := NewStore("")
+	_, err := s.Pause(jobName("ghost"))
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestStore_ResumeNotFound(t *testing.T) {
+	s := NewStore("")
+	_, err := s.Resume(jobName("ghost"))
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestStore_ListOrdersByName asserts the deterministic alphabetical
+// ordering relied on by ListJobs and by all test assertions that read
+// the result slice positionally.
 func TestStore_ListOrdersByName(t *testing.T) {
-	s := NewStore()
+	s := NewStore("")
 	for _, n := range []string{"b", "a", "c"} {
-		if _, err := s.Create(jobName(n), &schedulerpb.Job{}); err != nil {
+		if err := s.Create(&Job{Name: jobName(n)}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -458,8 +564,42 @@ func TestStore_ListOrdersByName(t *testing.T) {
 	}
 	want := []string{jobName("a"), jobName("b"), jobName("c")}
 	for i, j := range jobs {
-		if j.GetName() != want[i] {
-			t.Errorf("[%d] = %q, want %q", i, j.GetName(), want[i])
+		if j.Name != want[i] {
+			t.Errorf("[%d] = %q, want %q", i, j.Name, want[i])
 		}
+	}
+}
+
+// TestStore_ListParentSeparator verifies that the "/jobs/" separator
+// correctly discriminates between parent prefixes that would otherwise be
+// ambiguous (e.g. "projects/p/locations/us" vs
+// "projects/p/locations/us-central1"). This is the critical correctness
+// invariant that the store's List implementation depends on.
+func TestStore_ListParentSeparator(t *testing.T) {
+	s := NewStore("")
+	// Insert under two neighbouring parents whose names share a prefix.
+	parentA := "projects/p/locations/us"
+	parentB := "projects/p/locations/us-central1"
+	if err := s.Create(&Job{Name: parentA + "/jobs/j1"}); err != nil {
+		t.Fatalf("Create A: %v", err)
+	}
+	if err := s.Create(&Job{Name: parentB + "/jobs/j1"}); err != nil {
+		t.Fatalf("Create B: %v", err)
+	}
+	// List under parentA must NOT return the parentB job.
+	gotA := s.List(parentA)
+	if len(gotA) != 1 {
+		t.Fatalf("List(%q) len = %d, want 1", parentA, len(gotA))
+	}
+	if gotA[0].Name != parentA+"/jobs/j1" {
+		t.Errorf("List(%q)[0].Name = %q", parentA, gotA[0].Name)
+	}
+	// List under parentB must NOT return the parentA job.
+	gotB := s.List(parentB)
+	if len(gotB) != 1 {
+		t.Fatalf("List(%q) len = %d, want 1", parentB, len(gotB))
+	}
+	if gotB[0].Name != parentB+"/jobs/j1" {
+		t.Errorf("List(%q)[0].Name = %q", parentB, gotB[0].Name)
 	}
 }
