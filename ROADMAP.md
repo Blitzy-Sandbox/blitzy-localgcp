@@ -43,7 +43,11 @@ Fill the gaps that matter most for real-world adoption.
 
 - [x] Cloud KMS (encrypt/decrypt, sign/verify, MAC, key management)
 - [x] Cloud Logging (log ingestion, query, filtering, delete)
+- [x] Cloud Logging log sinks (pubsub:// and storage.googleapis.com/ destinations, fire-and-forget fan-out)
 - [x] Cloud Run (service CRUD with immediate operations)
+- [x] Cloud Run container execution (lazy Docker start on first request, per-service reverse proxy, 8200–8299 port pool)
+- [x] Cloud Scheduler (cron job CRUD, robfig/cron/v3 runner, HTTP and Pub/Sub target dispatch)
+- [x] GCS → Pub/Sub notification configs (OBJECT_FINALIZE / OBJECT_DELETE events via loopback gRPC)
 
 ## Phase 3b — IAM (deferred, needs design)
 
