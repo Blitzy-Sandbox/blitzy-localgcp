@@ -9,10 +9,12 @@ require (
 	cloud.google.com/go/logging v1.13.2
 	cloud.google.com/go/pubsub v1.50.2
 	cloud.google.com/go/run v1.17.0
+	cloud.google.com/go/scheduler v1.14.0
 	cloud.google.com/go/secretmanager v1.17.0
 	cloud.google.com/go/storage v1.59.0
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/docker/go-connections v0.6.0
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/spf13/cobra v1.10.2
 	google.golang.org/api v0.273.1
 	google.golang.org/genai v1.52.1
