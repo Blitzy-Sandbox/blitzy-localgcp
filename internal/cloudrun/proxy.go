@@ -68,10 +68,10 @@ const readinessWait = 10 * time.Second
 // CreateService call and stored in Service.proxies.
 type serviceProxy struct {
 	// Immutable configuration set at newServiceProxy time.
-	name         string                        // full resource name (projects/…/services/…)
-	image        string                        // Docker image reference
-	internalPort string                        // internal container port, e.g. "8080/tcp"
-	hostPort     int                           // reverse-proxy listener port, from the pool
+	name         string // full resource name (projects/…/services/…)
+	image        string // Docker image reference
+	internalPort string // internal container port, e.g. "8080/tcp"
+	hostPort     int    // reverse-proxy listener port, from the pool
 	// args is the concatenated Command+Args slice extracted from the
 	// Cloud Run service template (see extractArgs in service.go).
 	// Forwarded to Docker as the container's CMD directive via
@@ -83,11 +83,11 @@ type serviceProxy struct {
 	// service.go). Forwarded to Docker as additional environment
 	// variables via orchestrator.ContainerConfig.Env. Nil or empty
 	// means "use only the image's default env" (QA Issue #1 fix).
-	env          []string
-	runtime      orchestrator.ContainerRuntime // nil in --no-docker stub mode
-	store        *Store                        // persistence hook for ContainerID on successful boot
-	logger       *log.Logger
-	quiet        bool
+	env     []string
+	runtime orchestrator.ContainerRuntime // nil in --no-docker stub mode
+	store   *Store                        // persistence hook for ContainerID on successful boot
+	logger  *log.Logger
+	quiet   bool
 
 	// Mutable state — first-request boot, listener lifecycle.
 	once        sync.Once
