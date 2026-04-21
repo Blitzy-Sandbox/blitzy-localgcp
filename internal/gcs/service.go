@@ -602,6 +602,12 @@ func (s *Service) handleCopyObject(w http.ResponseWriter, r *http.Request, rest 
 		return
 	}
 
+	// Fire-and-forget notification fan-out (Rule 3). A copy produces a
+	// new object at the destination, so OBJECT_FINALIZE fires against
+	// the DESTINATION bucket (matching real GCS semantics where copyTo
+	// is equivalent to a write at the destination).
+	s.fanoutObjectEvent(dstBucket, *obj, "OBJECT_FINALIZE")
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(obj)
 }
