@@ -1,6 +1,6 @@
 # localgcp — LocalStack for GCP
 
-**Run Google Cloud locally.** One Go binary emulates fourteen GCP services on localhost: **Vertex AI, BigQuery, Spanner, Firestore, Pub/Sub, Cloud Storage, Bigtable, Cloud SQL, Memorystore, Cloud Tasks, Cloud KMS, Secret Manager, Cloud Run, Cloud Logging.** Zero cloud bills, zero API keys, works offline.
+**Run Google Cloud locally.** One Go binary emulates fifteen GCP services on localhost: **Vertex AI, BigQuery, Spanner, Firestore, Pub/Sub, Cloud Storage, Bigtable, Cloud SQL, Memorystore, Cloud Tasks, Cloud KMS, Secret Manager, Cloud Run, Cloud Logging, Cloud Scheduler.** Zero cloud bills, zero API keys, works offline.
 
 localgcp is the open-source GCP emulator — the LocalStack equivalent for Google Cloud. Your existing GCP client libraries (Go, Python, Java, Node.js) work unchanged via the standard `*_EMULATOR_HOST` environment variables.
 
@@ -33,7 +33,7 @@ Also available via Docker and pre-built binaries:
 
 ```bash
 # Docker
-docker run --rm -p 4443:4443 -p 8085:8085 -p 8086:8086 -p 8088:8088 -p 8089:8089 -p 8090:8090 -p 8091:8091 -p 8092:8092 -p 8093:8093 ghcr.io/slokam-ai/localgcp
+docker run --rm -p 4443:4443 -p 8085:8085 -p 8086:8086 -p 8088:8088 -p 8089:8089 -p 8090:8090 -p 8091:8091 -p 8092:8092 -p 8093:8093 -p 8094:8094 ghcr.io/slokam-ai/localgcp
 
 # Pre-built binary
 # Download from https://github.com/slokam-ai/localgcp/releases
@@ -52,7 +52,7 @@ Without Ollama running, localgcp returns deterministic stub responses, perfect f
 
 ## What it does
 
-localgcp emulates thirteen GCP services locally so you can develop and test without a cloud project, without credentials, and without a bill. Nine services run natively in the binary. Five more (Spanner, Bigtable, Cloud SQL, Memorystore, BigQuery) are orchestrated via Docker containers that start lazily on first use.
+localgcp emulates fifteen GCP services locally so you can develop and test without a cloud project, without credentials, and without a bill. Ten services run natively in the binary. Five more (Spanner, Bigtable, Cloud SQL, Memorystore, BigQuery) are orchestrated via Docker containers that start lazily on first use.
 
 | Service | Protocol | Port | Env var |
 |---------|----------|------|---------|
@@ -65,6 +65,7 @@ localgcp emulates thirteen GCP services locally so you can develop and test with
 | Cloud KMS | gRPC | 8091 | (manual endpoint config) |
 | Cloud Logging | gRPC | 8092 | (manual endpoint config) |
 | Cloud Run | gRPC | 8093 | (manual endpoint config) |
+| Cloud Scheduler | gRPC | 8094 | `CLOUD_SCHEDULER_EMULATOR_HOST` |
 | **Orchestrated (Docker required)** | | | |
 | Spanner | gRPC | 9010 | `SPANNER_EMULATOR_HOST` |
 | Bigtable | gRPC | 9094 | `BIGTABLE_EMULATOR_HOST` |
@@ -143,6 +144,9 @@ Your GCP client libraries work against localgcp with zero code changes (except S
 - Object listing with prefix and delimiter (directory-like browsing)
 - Signed URL generation and download
 - Works with both JSON API and XML API paths
+- **Pub/Sub notifications**: `PUT/GET/DELETE /storage/v1/b/{bucket}/notificationConfigs` endpoints
+- `OBJECT_FINALIZE` (on object PUT/POST) and `OBJECT_DELETE` (on object DELETE) events delivered via loopback gRPC to Pub/Sub
+- Canonical GCS JSON payload with `{eventType, bucketId}` attributes
 
 ### Pub/Sub
 - Topic and subscription management
@@ -218,11 +222,24 @@ Your GCP client libraries work against localgcp with zero code changes (except S
 - List log entries with filtering (severity, text payload, log name)
 - List distinct log names
 - Delete logs by name
+- **Log sinks**: `CreateSink` / `GetSink` / `UpdateSink` / `DeleteSink` / `ListSinks`
+- Sink destinations: `pubsub://projects/{project}/topics/{topic}` (loopback Pub/Sub) and `storage.googleapis.com/{bucket}` (loopback GCS)
+- Fire-and-forget fan-out on `WriteLogEntries` — delivery failures logged to stderr only
 
 ### Cloud Run
 - Service CRUD (create, get, list, update, delete)
 - Immediate operation completion (no polling required)
-- Auto-generated service URIs
+- **Container execution**: first HTTP invoke lazily starts the image via Docker, reverse proxy forwards request/response
+- Per-service allocated host port in the `8200–8299` pool (up to 100 concurrent services)
+- `--no-docker` mode returns a stub URI and never touches Docker
+
+### Cloud Scheduler
+- Job CRUD (create, get, list, update, delete)
+- Pause, Resume, and RunJob (immediate one-shot dispatch that preserves schedule and state)
+- Cron-based dispatch via `robfig/cron/v3` 5-field expressions
+- HTTP targets dispatched through the shared retrying HTTP dispatcher
+- Pub/Sub targets published via loopback gRPC
+- `CLOUD_SCHEDULER_EMULATOR_HOST=localhost:8094`
 
 ## CLI reference
 
@@ -247,6 +264,7 @@ localgcp --version         Print version
 | `--port-kms` | 8091 | Cloud KMS port |
 | `--port-logging` | 8092 | Cloud Logging port |
 | `--port-cloudrun` | 8093 | Cloud Run port |
+| `--port-cloud-scheduler` | 8094 | Cloud Scheduler port |
 | `--ollama-host` | `http://localhost:11434` | Ollama API host for Vertex AI |
 | `--vertex-model-map` | (defaults) | Model aliases (e.g. `gemini-2.5-flash=llama3.2`) |
 | `--vertex-backend` | `ollama` | Backend provider: `ollama`, `openai`, `anthropic`, `stub` |
@@ -261,7 +279,9 @@ localgcp --version         Print version
 
 ## How it works
 
-localgcp is a single Go binary. Nine services are implemented from scratch in Go with no runtime dependencies. Four additional services (Spanner, Bigtable, Cloud SQL, Memorystore) are orchestrated via Docker containers that start lazily on first use, requiring Docker to be installed. Native service data is stored in memory by default, with optional JSON-file persistence via `--data-dir`. Orchestrated services use ephemeral containers.
+localgcp is a single Go binary. Ten services are implemented from scratch in Go with no runtime dependencies. Five additional services (Spanner, Bigtable, Cloud SQL, Memorystore, BigQuery) are orchestrated via Docker containers that start lazily on first use, requiring Docker to be installed. Native service data is stored in memory by default, with optional JSON-file persistence via `--data-dir`. Orchestrated services use ephemeral containers.
+
+**Cross-service wiring.** Several services now communicate via in-process loopback: GCS object writes emit Pub/Sub notifications when a bucket has a configured `notificationConfig`; Cloud Logging sinks fan out matching entries to Pub/Sub topics or GCS buckets; Cloud Scheduler jobs dispatch to HTTP targets or Pub/Sub topics on their cron schedules. All cross-service delivery is fire-and-forget — the source service's RPC or HTTP response is never blocked on delivery.
 
 GCP client libraries already support `*_EMULATOR_HOST` environment variables. When these are set, the libraries connect to localhost instead of Google Cloud. localgcp uses this mechanism for zero-friction SDK compatibility.
 
@@ -274,8 +294,10 @@ GCP client libraries already support `*_EMULATOR_HOST` environment variables. Wh
 - Vertex AI: multimodal (images/audio)
 - Secret Manager: IAM bindings, replication policies, rotation
 - Cloud KMS: key import, key rotation schedules, raw encrypt/decrypt, asymmetric decrypt
-- Cloud Logging: structured payload queries, log sinks, log-based metrics, streaming tail
-- Cloud Run: container execution, revisions, traffic splitting, domain mapping
+- Cloud Logging: structured payload queries, log-based metrics, streaming tail
+- Cloud Run: revisions, traffic splitting, domain mapping, IAM injection
+- Cloud Scheduler: App Engine HTTP targets, OIDC/OAuth authentication on HTTP targets
+- GCS notifications: event types beyond OBJECT_FINALIZE/OBJECT_DELETE, prefix/suffix filtering
 - Orchestrated services: data persistence across restarts, Spanner REST admin API
 - IAM/auth enforcement (all requests are accepted)
 
