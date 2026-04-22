@@ -6,13 +6,48 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+)
+
+// Sentinel errors returned by Store methods. They are wrapped via
+// fmt.Errorf("...: %w", Err...) so callers can match the category of
+// failure with errors.Is(err, ErrBucketNotFound) while still preserving
+// the contextual error message for logging and API responses.
+//
+// These sentinels are the authoritative error-category source for the
+// gcs service layer (internal/gcs/service.go) which maps each category
+// to the corresponding HTTP status code (404, 409, ...). Adding a new
+// sentinel here requires adding a matching errors.Is branch in the
+// service layer — the two are contractually paired.
+var (
+	// ErrBucketNotFound is returned when an operation references a
+	// bucket that does not exist. Maps to HTTP 404.
+	ErrBucketNotFound = errors.New("gcs: bucket not found")
+
+	// ErrObjectNotFound is returned when an operation references an
+	// object that does not exist. Maps to HTTP 404.
+	ErrObjectNotFound = errors.New("gcs: object not found")
+
+	// ErrNotificationNotFound is returned when an operation references a
+	// notification config id that does not exist for the bucket.
+	// Maps to HTTP 404.
+	ErrNotificationNotFound = errors.New("gcs: notification not found")
+
+	// ErrBucketNotEmpty is returned when DeleteBucket is called against a
+	// bucket that still contains objects. Maps to HTTP 409.
+	ErrBucketNotEmpty = errors.New("gcs: bucket not empty")
+
+	// ErrBucketAlreadyExists is returned when CreateBucket is called with
+	// a name that is already registered. Maps to HTTP 409.
+	ErrBucketAlreadyExists = errors.New("gcs: bucket already exists")
 )
 
 // Bucket represents a GCS bucket.
@@ -41,6 +76,69 @@ type Object struct {
 	Crc32c          string `json:"crc32c"`
 	Etag            string `json:"etag"`
 	ContentEncoding string `json:"contentEncoding,omitempty"`
+	SelfLink        string `json:"selfLink,omitempty"`
+}
+
+// NotificationConfig is a Cloud Storage notification configuration that
+// routes object events to a Pub/Sub topic. See AAP Extension B.
+//
+// The TopicName field is a full resource name in the form
+// `projects/{project}/topics/{topic}` — the format produced by the
+// Cloud Storage API when using the JSON representation. Its JSON tag
+// remains "topic" so the on-the-wire representation matches the
+// canonical GCS notification config schema exactly.
+//
+// The struct is intentionally defined as a value type so both Store
+// fan-out paths (snapshot copies in NotificationsForBucket) and the
+// HTTP handler responses in service.go can marshal without leaking
+// pointer aliases to internal state.
+type NotificationConfig struct {
+	// Kind is the resource kind, always "storage#notification".
+	Kind string `json:"kind"`
+
+	// ID is the per-bucket unique identifier assigned by the Store at
+	// creation time.
+	ID string `json:"id"`
+
+	// TopicName is the fully-qualified Pub/Sub topic name that object
+	// event notifications are published to, typically of the form
+	// "projects/{project}/topics/{topic}". The JSON key remains "topic"
+	// for wire-format parity with the real GCS notification config API.
+	TopicName string `json:"topic"`
+
+	// PayloadFormat controls what body is sent to the topic. The
+	// emulator produces "JSON_API_V1" only; "NONE" is accepted for
+	// round-trip compatibility.
+	PayloadFormat string `json:"payload_format"`
+
+	// EventTypes is the list of object event types this config
+	// subscribes to. Supported values: "OBJECT_FINALIZE",
+	// "OBJECT_DELETE". Empty means "all supported events" per GCS
+	// convention, which the service layer expands at fan-out time.
+	EventTypes []string `json:"event_types,omitempty"`
+
+	// CustomAttributes carries extra Pub/Sub message attributes that
+	// are merged on top of the standard {eventType, bucketId} attrs at
+	// delivery time.
+	CustomAttributes map[string]string `json:"custom_attributes,omitempty"`
+
+	// ObjectNamePrefix filters which object names trigger this
+	// notification. An empty string matches all objects.
+	ObjectNamePrefix string `json:"object_name_prefix,omitempty"`
+
+	// Etag is the server-assigned version identifier for optimistic
+	// concurrency, set on create.
+	Etag string `json:"etag,omitempty"`
+
+	// SelfLink is the fully-qualified URL to this notification config,
+	// set on create.
+	SelfLink string `json:"selfLink,omitempty"`
+}
+
+// NotificationList is the response for ListNotifications.
+type NotificationList struct {
+	Kind  string               `json:"kind"` // "storage#notifications"
+	Items []NotificationConfig `json:"items"`
 }
 
 // BucketList is the response for listing buckets.
@@ -61,6 +159,14 @@ type Store struct {
 	mu      sync.RWMutex
 	buckets map[string]*Bucket
 	objects map[string]map[string]*storedObject // bucket -> object name -> object
+
+	// notifications is the per-bucket notification-config registry used
+	// by GCS→Pub/Sub fan-out. Keyed by bucket name then by config id.
+	notifications map[string]map[string]*NotificationConfig
+
+	// notifCounter generates per-store unique notification config ids.
+	notifCounter uint64
+
 	dataDir string
 }
 
@@ -73,9 +179,10 @@ type storedObject struct {
 // persisted state and flushes on writes.
 func NewStore(dataDir string) *Store {
 	s := &Store{
-		buckets: make(map[string]*Bucket),
-		objects: make(map[string]map[string]*storedObject),
-		dataDir: dataDir,
+		buckets:       make(map[string]*Bucket),
+		objects:       make(map[string]map[string]*storedObject),
+		notifications: make(map[string]map[string]*NotificationConfig),
+		dataDir:       dataDir,
 	}
 	if dataDir != "" {
 		s.load()
@@ -90,7 +197,7 @@ func (s *Store) CreateBucket(name, project string) (*Bucket, error) {
 	defer s.mu.Unlock()
 
 	if _, exists := s.buckets[name]; exists {
-		return nil, fmt.Errorf("conflict: bucket %q already exists", name)
+		return nil, fmt.Errorf("conflict: bucket %q: %w", name, ErrBucketAlreadyExists)
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -106,6 +213,7 @@ func (s *Store) CreateBucket(name, project string) (*Bucket, error) {
 	}
 	s.buckets[name] = b
 	s.objects[name] = make(map[string]*storedObject)
+	s.notifications[name] = make(map[string]*NotificationConfig)
 	s.persist()
 	return b, nil
 }
@@ -134,16 +242,123 @@ func (s *Store) DeleteBucket(name string) error {
 	defer s.mu.Unlock()
 
 	if _, exists := s.buckets[name]; !exists {
-		return fmt.Errorf("not found: bucket %q", name)
+		return fmt.Errorf("bucket %q: %w", name, ErrBucketNotFound)
 	}
 	if objs, ok := s.objects[name]; ok && len(objs) > 0 {
-		return fmt.Errorf("conflict: bucket %q is not empty", name)
+		return fmt.Errorf("bucket %q: %w", name, ErrBucketNotEmpty)
 	}
 
 	delete(s.buckets, name)
 	delete(s.objects, name)
+	delete(s.notifications, name)
 	s.persist()
 	return nil
+}
+
+// --- Notification configuration operations ---
+//
+// NotificationConfigs are scoped to a bucket and identified by a
+// per-bucket integer id encoded as a string. Create returns the
+// populated config with ID set; the other methods are standard
+// get/list/delete semantics.
+
+// CreateNotification registers a new notification configuration for
+// `bucket`. Returns a populated copy (Kind, ID, Etag, SelfLink) or an
+// error if the bucket does not exist.
+func (s *Store) CreateNotification(bucket string, cfg NotificationConfig) (*NotificationConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.buckets[bucket]; !exists {
+		return nil, fmt.Errorf("bucket %q: %w", bucket, ErrBucketNotFound)
+	}
+	if _, ok := s.notifications[bucket]; !ok {
+		s.notifications[bucket] = make(map[string]*NotificationConfig)
+	}
+	s.notifCounter++
+	cfg.ID = fmt.Sprintf("%d", s.notifCounter)
+	cfg.Kind = "storage#notification"
+	cfg.Etag = generateEtag()
+	cfg.SelfLink = fmt.Sprintf("https://storage.googleapis.com/storage/v1/b/%s/notificationConfigs/%s", bucket, cfg.ID)
+	if cfg.PayloadFormat == "" {
+		cfg.PayloadFormat = "JSON_API_V1"
+	}
+	if len(cfg.EventTypes) == 0 {
+		// Empty means "all event types" per GCS convention. Callers that
+		// want an explicit subset may specify OBJECT_FINALIZE / OBJECT_DELETE.
+		cfg.EventTypes = nil
+	}
+	stored := cfg
+	s.notifications[bucket][cfg.ID] = &stored
+	s.persist()
+	return &stored, nil
+}
+
+// GetNotification returns the notification config with the given id,
+// or (nil, false) if no such config exists.
+func (s *Store) GetNotification(bucket, id string) (*NotificationConfig, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	byID, ok := s.notifications[bucket]
+	if !ok {
+		return nil, false
+	}
+	c, ok := byID[id]
+	if !ok {
+		return nil, false
+	}
+	// Return a defensive copy so callers cannot mutate store state.
+	copied := *c
+	return &copied, true
+}
+
+// ListNotifications returns all configs for the bucket, sorted by id.
+// Returns nil (empty list) if the bucket does not exist or has no
+// configs. The second return value is true when the bucket itself
+// exists (so callers can distinguish "no configs" from "no bucket").
+func (s *Store) ListNotifications(bucket string) ([]NotificationConfig, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, exists := s.buckets[bucket]; !exists {
+		return nil, false
+	}
+	byID := s.notifications[bucket]
+	out := make([]NotificationConfig, 0, len(byID))
+	for _, c := range byID {
+		out = append(out, *c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, true
+}
+
+// DeleteNotification removes the named config. Returns an error if the
+// config does not exist.
+func (s *Store) DeleteNotification(bucket, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	byID, ok := s.notifications[bucket]
+	if !ok {
+		return fmt.Errorf("bucket %q: %w", bucket, ErrBucketNotFound)
+	}
+	if _, ok := byID[id]; !ok {
+		return fmt.Errorf("notification %q in bucket %q: %w", id, bucket, ErrNotificationNotFound)
+	}
+	delete(byID, id)
+	s.persist()
+	return nil
+}
+
+// NotificationsForBucket returns a snapshot copy of the configs for
+// the bucket. Used by the fan-out path to avoid holding the store
+// lock while publishing to Pub/Sub.
+func (s *Store) NotificationsForBucket(bucket string) []NotificationConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	byID := s.notifications[bucket]
+	out := make([]NotificationConfig, 0, len(byID))
+	for _, c := range byID {
+		out = append(out, *c)
+	}
+	return out
 }
 
 // --- Object operations ---
@@ -153,7 +368,7 @@ func (s *Store) PutObject(bucket, name, contentType string, content []byte) (*Ob
 	defer s.mu.Unlock()
 
 	if _, exists := s.buckets[bucket]; !exists {
-		return nil, fmt.Errorf("not found: bucket %q", bucket)
+		return nil, fmt.Errorf("bucket %q: %w", bucket, ErrBucketNotFound)
 	}
 
 	if contentType == "" {
@@ -176,6 +391,14 @@ func (s *Store) PutObject(bucket, name, contentType string, content []byte) (*Ob
 		Md5Hash:     base64.StdEncoding.EncodeToString(md5sum[:]),
 		Crc32c:      "AAAAAA==",
 		Etag:        hex.EncodeToString(sha256sum[:8]),
+		// SelfLink is the canonical JSON API URL for the object per
+		// the GCS REST schema. It is required by AAP §0.1.1 for the
+		// notification payload to include all 8 canonical fields
+		// {kind, id, selfLink, name, bucket, contentType, timeCreated,
+		// updated}. The path segment is percent-encoded because object
+		// names may contain spaces, slashes, Unicode, and reserved
+		// characters (see TestNotification special-character suite).
+		SelfLink: fmt.Sprintf("https://www.googleapis.com/storage/v1/b/%s/o/%s", bucket, url.PathEscape(name)),
 	}
 
 	s.objects[bucket][name] = &storedObject{Meta: *obj, Content: content}
@@ -204,10 +427,10 @@ func (s *Store) DeleteObject(bucket, name string) error {
 
 	objs, ok := s.objects[bucket]
 	if !ok {
-		return fmt.Errorf("not found: bucket %q", bucket)
+		return fmt.Errorf("bucket %q: %w", bucket, ErrBucketNotFound)
 	}
 	if _, ok := objs[name]; !ok {
-		return fmt.Errorf("not found: object %q in bucket %q", name, bucket)
+		return fmt.Errorf("object %q in bucket %q: %w", name, bucket, ErrObjectNotFound)
 	}
 
 	delete(objs, name)
@@ -220,16 +443,16 @@ func (s *Store) CopyObject(srcBucket, srcName, dstBucket, dstName string) (*Obje
 	defer s.mu.Unlock()
 
 	if _, exists := s.buckets[dstBucket]; !exists {
-		return nil, fmt.Errorf("not found: bucket %q", dstBucket)
+		return nil, fmt.Errorf("bucket %q: %w", dstBucket, ErrBucketNotFound)
 	}
 
 	srcObjs, ok := s.objects[srcBucket]
 	if !ok {
-		return nil, fmt.Errorf("not found: bucket %q", srcBucket)
+		return nil, fmt.Errorf("bucket %q: %w", srcBucket, ErrBucketNotFound)
 	}
 	src, ok := srcObjs[srcName]
 	if !ok {
-		return nil, fmt.Errorf("not found: object %q in bucket %q", srcName, srcBucket)
+		return nil, fmt.Errorf("object %q in bucket %q: %w", srcName, srcBucket, ErrObjectNotFound)
 	}
 
 	// Make an independent copy of the content.
@@ -243,6 +466,11 @@ func (s *Store) CopyObject(srcBucket, srcName, dstBucket, dstName string) (*Obje
 	obj.Bucket = dstBucket
 	obj.TimeCreated = now
 	obj.Updated = now
+	// Rebuild SelfLink for the destination so the notification payload
+	// emitted by the fan-out path carries the correct canonical URL
+	// (AAP §0.1.1). The source's SelfLink would point at the source
+	// bucket/object, which is incorrect for a copied object.
+	obj.SelfLink = fmt.Sprintf("https://www.googleapis.com/storage/v1/b/%s/o/%s", dstBucket, url.PathEscape(dstName))
 
 	s.objects[dstBucket][dstName] = &storedObject{Meta: obj, Content: content}
 	s.persist()
@@ -300,8 +528,10 @@ func (s *Store) ListObjects(bucket, prefix, delimiter string, maxResults int) ([
 // --- Persistence ---
 
 type persistedState struct {
-	Buckets []Bucket                   `json:"buckets"`
-	Objects map[string][]persistedObj  `json:"objects"`
+	Buckets       []Bucket                        `json:"buckets"`
+	Objects       map[string][]persistedObj       `json:"objects"`
+	Notifications map[string][]NotificationConfig `json:"notifications,omitempty"`
+	NotifCounter  uint64                          `json:"notifCounter,omitempty"`
 }
 
 type persistedObj struct {
@@ -318,8 +548,10 @@ func (s *Store) persist() {
 	os.MkdirAll(dir, 0o755)
 
 	state := persistedState{
-		Buckets: make([]Bucket, 0, len(s.buckets)),
-		Objects: make(map[string][]persistedObj),
+		Buckets:       make([]Bucket, 0, len(s.buckets)),
+		Objects:       make(map[string][]persistedObj),
+		Notifications: make(map[string][]NotificationConfig),
+		NotifCounter:  s.notifCounter,
 	}
 
 	for _, b := range s.buckets {
@@ -335,6 +567,14 @@ func (s *Store) persist() {
 			})
 		}
 		state.Objects[bucket] = pObjs
+	}
+
+	for bucket, notifs := range s.notifications {
+		list := make([]NotificationConfig, 0, len(notifs))
+		for _, n := range notifs {
+			list = append(list, *n)
+		}
+		state.Notifications[bucket] = list
 	}
 
 	data, _ := json.MarshalIndent(state, "", "  ")
@@ -373,6 +613,27 @@ func (s *Store) load() {
 			}
 			s.objects[bucket][po.Meta.Name] = &storedObject{Meta: po.Meta, Content: content}
 		}
+	}
+
+	// Restore notification configs. A bucket that lost its notifications map on
+	// load (e.g., because an older state.json omitted the field) gets an empty
+	// map so subsequent CreateNotification calls succeed.
+	for bucket := range s.buckets {
+		if _, ok := s.notifications[bucket]; !ok {
+			s.notifications[bucket] = make(map[string]*NotificationConfig)
+		}
+	}
+	for bucket, notifs := range state.Notifications {
+		if _, ok := s.notifications[bucket]; !ok {
+			s.notifications[bucket] = make(map[string]*NotificationConfig)
+		}
+		for i := range notifs {
+			n := notifs[i]
+			s.notifications[bucket][n.ID] = &n
+		}
+	}
+	if state.NotifCounter > s.notifCounter {
+		s.notifCounter = state.NotifCounter
 	}
 }
 

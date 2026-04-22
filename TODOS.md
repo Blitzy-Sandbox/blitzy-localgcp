@@ -34,11 +34,33 @@
 - Redis gets `appendonly yes` mode when persisting. Postgres mounts `/var/lib/postgresql/data`.
 - Spanner and Bigtable emulators don't support persistence (ephemeral only).
 
-## Future Services
+## Phase 3c — Cross-service wiring and Cloud Scheduler
 
-### BigQuery emulator (orchestrated)
-- **What:** Add BigQuery as an orchestrated service using [goccy/bigquery-emulator](https://github.com/goccy/bigquery-emulator) Docker image (`ghcr.io/goccy/bigquery-emulator`).
-- **Why:** Frequently requested. BigQuery is one of the most-used GCP services for data engineers.
-- **Context:** The existing emulator uses ZetaSQL (Google's actual SQL parser) + SQLite. REST API on port 9050. Supports `BIGQUERY_EMULATOR_HOST` env var. Just needs a config entry in `internal/orchestrator/config.go`, same pattern as Spanner.
-- **Effort:** ~5 min (config + CLI wiring). No custom implementation needed.
-- **Depends on:** Nothing. Orchestrator framework already supports this.
+### ~~Cloud Scheduler (native service)~~ (DONE)
+- New native gRPC service on port 8094, registered with `schedulerpb.RegisterCloudSchedulerServer`.
+- Eight in-scope RPCs: `CreateJob`, `GetJob`, `ListJobs`, `DeleteJob`, `UpdateJob`, `RunJob`, `PauseJob`, `ResumeJob`.
+- Single `robfig/cron/v3` runner goroutine dispatches `HttpTarget` jobs via `internal/dispatch.Dispatcher` and `PubsubTarget` jobs via loopback Pub/Sub gRPC.
+- `RunJob` performs an immediate single dispatch without mutating `schedule` or `state`.
+- CLI flag `--port-cloud-scheduler` (default 8094) + `CLOUD_SCHEDULER_EMULATOR_HOST=localhost:8094` env export.
+
+### ~~Cloud Run actual container execution~~ (DONE)
+- `CreateService` allocates a host port from the 8200–8299 pool and registers the container image without starting.
+- First HTTP request to the service URI triggers on-demand `CreateContainer` + `StartContainer` via `internal/orchestrator.ContainerRuntime`.
+- `DeleteService` calls `StopContainer` + `RemoveContainer` and frees the port.
+- Bounded pool: 100 concurrent services maximum, overflow returns `codes.ResourceExhausted`.
+- `--no-docker` mode returns a non-empty stub URI without invoking Docker.
+- Service URIs now return `http://localhost:{hostPort}` instead of synthetic `run.app` strings.
+
+### ~~GCS → Pub/Sub notifications~~ (DONE)
+- New `PUT/GET/DELETE /storage/v1/b/{bucket}/notificationConfigs` HTTP handlers.
+- Object `PUT`/`POST` emits `OBJECT_FINALIZE` events; `DELETE` emits `OBJECT_DELETE` events.
+- Canonical GCS JSON notification payload with `{eventType, bucketId}` attributes via loopback gRPC.
+- Fire-and-forget goroutine model — GCS response latency unaffected by Pub/Sub publish.
+
+### ~~Cloud Logging sinks~~ (DONE)
+- Five new sink RPCs: `CreateSink`, `GetSink`, `UpdateSink`, `DeleteSink`, `ListSinks`.
+- Destinations: `pubsub.googleapis.com/projects/{project}/topics/{topic}` or `storage.googleapis.com/{bucket}`.
+- `WriteLogEntries` fans out matching entries to each sink via fire-and-forget goroutine.
+- Delivery failures logged to stderr; `WriteLogEntries` caller never sees sink errors.
+
+

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -26,7 +27,12 @@ type Service struct {
 
 	// resumable uploads in progress: upload ID -> pending upload state
 	resumableMu sync.Mutex
-	resumables   map[string]*resumableUpload
+	resumables  map[string]*resumableUpload
+
+	// pubsubAddr is the loopback Pub/Sub endpoint used for notification
+	// fan-out. Empty string disables fan-out entirely (AAP Rule 7a).
+	// Set via SetPubsubEndpoint after construction.
+	pubsubAddr string
 }
 
 type resumableUpload struct {
@@ -37,15 +43,51 @@ type resumableUpload struct {
 }
 
 // New creates a new GCS service.
-func New(dataDir string, quiet bool) *Service {
+//
+// Per AAP §0.1.1 and Rule 7a, New accepts trailing variadic address
+// arguments so callers may configure the cross-service loopback endpoints
+// at construction time. Currently only a single address is consumed:
+//
+//	New(dataDir, quiet)                // no loopback endpoints
+//	New(dataDir, quiet, pubsubAddr)    // enable Pub/Sub notification fan-out
+//
+// An empty string (or omitted argument) silently disables notification
+// fan-out — no error is raised, no log line is emitted, and notification
+// publishing becomes a no-op. This preserves the "zero call-site changes
+// in existing test files" criterion of Rule 7a because the testServer
+// helpers call New("", true) which leaves pubsubAddr empty and thereby
+// dormant.
+//
+// Extra trailing arguments beyond the first are reserved for future
+// endpoints and are currently ignored. The SetPubsubEndpoint method is
+// preserved as a convenience for post-construction wiring, but the
+// variadic constructor form is the AAP-canonical API.
+func New(dataDir string, quiet bool, addrs ...string) *Service {
 	logger := log.New(os.Stderr, "[gcs] ", log.LstdFlags)
-	return &Service{
+	s := &Service{
 		dataDir:    dataDir,
 		quiet:      quiet,
 		logger:     logger,
 		store:      NewStore(dataDir),
 		resumables: make(map[string]*resumableUpload),
 	}
+	if len(addrs) >= 1 {
+		s.pubsubAddr = addrs[0]
+	}
+	return s
+}
+
+// SetPubsubEndpoint configures the loopback Pub/Sub endpoint used by the
+// notification-config fan-out path. An empty string disables fan-out
+// (silently skipped — no error, no log) per AAP Rule 7a.
+//
+// This method is preserved for backward compatibility with callers that
+// construct the service without a pubsub address and wire it later. The
+// variadic New(..., pubsubAddr) form is the preferred API. This method
+// must be called before Start — the value is read from fan-out
+// goroutines without synchronization. Calling it after Start is racy.
+func (s *Service) SetPubsubEndpoint(addr string) {
+	s.pubsubAddr = addr
 }
 
 func (s *Service) Name() string { return "Cloud Storage" }
@@ -80,11 +122,12 @@ func (s *Service) Start(ctx context.Context, addr string) error {
 // registerRoutes sets up all GCS JSON API routes.
 //
 // GCS JSON API path structure:
-//   /storage/v1/b                          — list/create buckets
-//   /storage/v1/b/{bucket}                 — get/delete bucket
-//   /storage/v1/b/{bucket}/o               — list objects
-//   /storage/v1/b/{bucket}/o/{object...}   — get/delete object (object can contain /)
-//   /upload/storage/v1/b/{bucket}/o        — upload objects
+//
+//	/storage/v1/b                          — list/create buckets
+//	/storage/v1/b/{bucket}                 — get/delete bucket
+//	/storage/v1/b/{bucket}/o               — list objects
+//	/storage/v1/b/{bucket}/o/{object...}   — get/delete object (object can contain /)
+//	/upload/storage/v1/b/{bucket}/o        — upload objects
 //
 // Object names can contain slashes, so we can't use simple path params.
 // We route by prefix and parse manually.
@@ -157,6 +200,44 @@ func (s *Service) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check for /notificationConfigs (notification-config CRUD, AAP Extension B).
+	// Path shapes after trimming the /storage/v1/b/ prefix:
+	//   {bucket}/notificationConfigs         — list / create
+	//   {bucket}/notificationConfigs/{id}    — get / delete
+	if ncIdx := strings.Index(rest, "/notificationConfigs"); ncIdx > 0 {
+		bucket := rest[:ncIdx]
+		tail := rest[ncIdx+len("/notificationConfigs"):]
+		switch {
+		case tail == "" || tail == "/":
+			// collection-level: list (GET) or create (PUT/POST)
+			switch r.Method {
+			case http.MethodGet:
+				s.handleNotificationList(w, r, bucket)
+			case http.MethodPut, http.MethodPost:
+				s.handleNotificationCreate(w, r, bucket)
+			default:
+				writeError(w, http.StatusMethodNotAllowed, "methodNotAllowed", "Method not allowed")
+			}
+		default:
+			// item-level: path is "/{id}" — trim leading slash
+			id := strings.TrimPrefix(tail, "/")
+			// reject nested sub-paths like /{id}/extra
+			if strings.Contains(id, "/") {
+				writeNotFound(w, fmt.Sprintf("Path not found: %s", r.URL.Path))
+				return
+			}
+			switch r.Method {
+			case http.MethodGet:
+				s.handleNotificationGet(w, r, bucket, id)
+			case http.MethodDelete:
+				s.handleNotificationDelete(w, r, bucket, id)
+			default:
+				writeError(w, http.StatusMethodNotAllowed, "methodNotAllowed", "Method not allowed")
+			}
+		}
+		return
+	}
+
 	// Check for /o/ (object operations)
 	oIdx := strings.Index(rest, "/o/")
 	if oIdx >= 0 {
@@ -214,7 +295,7 @@ func (s *Service) handleCreateBucket(w http.ResponseWriter, r *http.Request) {
 
 	b, err := s.store.CreateBucket(body.Name, project)
 	if err != nil {
-		if strings.Contains(err.Error(), "conflict") {
+		if errors.Is(err, ErrBucketAlreadyExists) {
 			writeConflict(w, fmt.Sprintf("You already own this bucket: %s", body.Name))
 			return
 		}
@@ -246,16 +327,192 @@ func (s *Service) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handleDeleteBucket(w http.ResponseWriter, r *http.Request, name string) {
 	err := s.store.DeleteBucket(name)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		switch {
+		case errors.Is(err, ErrBucketNotFound):
 			writeNotFound(w, fmt.Sprintf("The specified bucket does not exist: %s", name))
-		} else if strings.Contains(err.Error(), "not empty") {
+		case errors.Is(err, ErrBucketNotEmpty):
 			writeConflict(w, "The bucket you tried to delete is not empty.")
-		} else {
+		default:
 			writeError(w, http.StatusInternalServerError, "internalError", err.Error())
 		}
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- Notification configuration handlers (AAP Extension B) ---
+//
+// These handlers expose the per-bucket NotificationConfig CRUD surface at
+//   /storage/v1/b/{bucket}/notificationConfigs[/{id}]
+// matching the GCS JSON API. Creation accepts a subset of the full
+// NotificationConfig proto (topic is required; event_types, custom
+// attributes, object_name_prefix, and payload_format are optional).
+// The server assigns the id.
+
+func (s *Service) handleNotificationCreate(w http.ResponseWriter, r *http.Request, bucket string) {
+	if _, ok := s.store.GetBucket(bucket); !ok {
+		writeNotFound(w, fmt.Sprintf("The specified bucket does not exist: %s", bucket))
+		return
+	}
+
+	var cfg NotificationConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeBadRequest(w, "Invalid JSON body")
+		return
+	}
+	if cfg.TopicName == "" {
+		writeBadRequest(w, "topic is required (projects/{project}/topics/{topic})")
+		return
+	}
+
+	created, err := s.store.CreateNotification(bucket, cfg)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internalError", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(created)
+}
+
+func (s *Service) handleNotificationGet(w http.ResponseWriter, r *http.Request, bucket, id string) {
+	if _, ok := s.store.GetBucket(bucket); !ok {
+		writeNotFound(w, fmt.Sprintf("The specified bucket does not exist: %s", bucket))
+		return
+	}
+	cfg, ok := s.store.GetNotification(bucket, id)
+	if !ok {
+		writeNotFound(w, fmt.Sprintf("No such notification: %s/%s", bucket, id))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(cfg)
+}
+
+func (s *Service) handleNotificationList(w http.ResponseWriter, r *http.Request, bucket string) {
+	items, bucketExists := s.store.ListNotifications(bucket)
+	if !bucketExists {
+		writeNotFound(w, fmt.Sprintf("The specified bucket does not exist: %s", bucket))
+		return
+	}
+	if items == nil {
+		items = []NotificationConfig{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(NotificationList{
+		Kind:  "storage#notifications",
+		Items: items,
+	})
+}
+
+func (s *Service) handleNotificationDelete(w http.ResponseWriter, r *http.Request, bucket, id string) {
+	if err := s.store.DeleteNotification(bucket, id); err != nil {
+		if errors.Is(err, ErrBucketNotFound) || errors.Is(err, ErrNotificationNotFound) {
+			writeNotFound(w, fmt.Sprintf("No such notification: %s/%s", bucket, id))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internalError", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- Object event fan-out (AAP Extension B) ---
+//
+// fanoutObjectEvent delivers a notification to every matching config on the
+// bucket. Delivery happens on a per-config goroutine so the request handler
+// never blocks on Pub/Sub (Rule 3). Delivery failures are logged to stderr
+// and never surfaced to the caller.
+//
+// Matching rules (following real GCS semantics):
+//   - empty EventTypes means "match all event types"
+//   - empty ObjectNamePrefix means "match all object names"
+//
+// The payload is the full Object metadata JSON, matching the JSON_API_V1
+// payload format. Attributes include the GCS-canonical {eventType,
+// bucketId} pair required by the AAP.
+func (s *Service) fanoutObjectEvent(bucket string, obj Object, eventType string) {
+	if s.pubsubAddr == "" {
+		// Fan-out is disabled (Rule 7a silent skip).
+		return
+	}
+
+	configs := s.store.NotificationsForBucket(bucket)
+	if len(configs) == 0 {
+		return
+	}
+
+	for i := range configs {
+		cfg := configs[i]
+		if !cfg.matchesEvent(eventType) {
+			continue
+		}
+		if !cfg.matchesObject(obj.Name) {
+			continue
+		}
+		// Fire-and-forget — one goroutine per matching config.
+		go s.deliverNotification(cfg, obj, eventType, bucket)
+	}
+}
+
+// deliverNotification publishes a single object event to the Pub/Sub topic
+// referenced by cfg. Invoked from a goroutine; never returns a value.
+func (s *Service) deliverNotification(cfg NotificationConfig, obj Object, eventType, bucketID string) {
+	// PayloadFormat=NONE means the body should be empty (GCS convention).
+	var payload []byte
+	if cfg.PayloadFormat != "NONE" {
+		var err error
+		payload, err = json.Marshal(obj)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[gcs] notification: marshal object %s/%s: %v\n", bucketID, obj.Name, err)
+			return
+		}
+	}
+
+	// Attributes: AAP-required eventType and bucketId, plus any
+	// user-defined custom_attributes on the config.
+	attrs := map[string]string{
+		"eventType":          eventType,
+		"bucketId":           bucketID,
+		"objectId":           obj.Name,
+		"objectGeneration":   obj.Etag,
+		"payloadFormat":      cfg.PayloadFormat,
+		"notificationConfig": fmt.Sprintf("projects/_/buckets/%s/notificationConfigs/%s", bucketID, cfg.ID),
+	}
+	for k, v := range cfg.CustomAttributes {
+		// Don't let user-defined attributes override the canonical ones.
+		if _, exists := attrs[k]; !exists {
+			attrs[k] = v
+		}
+	}
+
+	if err := publishToPubsub(s.pubsubAddr, cfg.TopicName, payload, attrs); err != nil {
+		fmt.Fprintf(os.Stderr, "[gcs] notification: deliver %s → %s: %v\n", obj.Name, cfg.TopicName, err)
+	}
+}
+
+// matchesEvent reports whether the config should fan-out for the given
+// event type. An empty EventTypes slice means "match all events".
+func (n *NotificationConfig) matchesEvent(eventType string) bool {
+	if len(n.EventTypes) == 0 {
+		return true
+	}
+	for _, t := range n.EventTypes {
+		if t == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesObject reports whether the config should fan-out for the given
+// object name. An empty ObjectNamePrefix means "match all objects".
+func (n *NotificationConfig) matchesObject(objectName string) bool {
+	if n.ObjectNamePrefix == "" {
+		return true
+	}
+	return strings.HasPrefix(objectName, n.ObjectNamePrefix)
 }
 
 // --- Object handlers ---
@@ -282,14 +539,31 @@ func (s *Service) handleGetObject(w http.ResponseWriter, r *http.Request, bucket
 }
 
 func (s *Service) handleDeleteObject(w http.ResponseWriter, r *http.Request, bucket, name string) {
+	// Capture the object metadata BEFORE deletion so the OBJECT_DELETE
+	// notification payload carries the object's last-known state. The
+	// store's DeleteObject only returns an error (not the removed object),
+	// so we snapshot via GetObject first. If the object does not exist,
+	// the DeleteObject call below will produce the canonical "not found"
+	// error and we skip the fan-out. GetObject returns
+	// (meta *Object, content []byte, ok bool) — we only need the meta.
+	meta, _, existed := s.store.GetObject(bucket, name)
+
 	if err := s.store.DeleteObject(bucket, name); err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, ErrBucketNotFound) || errors.Is(err, ErrObjectNotFound) {
 			writeNotFound(w, fmt.Sprintf("No such object: %s/%s", bucket, name))
 		} else {
 			writeError(w, http.StatusInternalServerError, "internalError", err.Error())
 		}
 		return
 	}
+
+	// Fire-and-forget OBJECT_DELETE notification fan-out (Rule 3).
+	// meta is a defensive copy returned by GetObject, so it may be safely
+	// handed to the goroutine after this function returns.
+	if existed && meta != nil {
+		s.fanoutObjectEvent(bucket, *meta, "OBJECT_DELETE")
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -342,13 +616,19 @@ func (s *Service) handleCopyObject(w http.ResponseWriter, r *http.Request, rest 
 
 	obj, err := s.store.CopyObject(srcBucket, srcObject, dstBucket, dstObject)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, ErrBucketNotFound) || errors.Is(err, ErrObjectNotFound) {
 			writeNotFound(w, err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "internalError", err.Error())
 		}
 		return
 	}
+
+	// Fire-and-forget notification fan-out (Rule 3). A copy produces a
+	// new object at the destination, so OBJECT_FINALIZE fires against
+	// the DESTINATION bucket (matching real GCS semantics where copyTo
+	// is equivalent to a write at the destination).
+	s.fanoutObjectEvent(dstBucket, *obj, "OBJECT_FINALIZE")
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(obj)
@@ -406,6 +686,11 @@ func (s *Service) handleSimpleUpload(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 
+	// Fire-and-forget notification fan-out (Rule 3). A snapshot of the
+	// Object value is copied onto the goroutine stack so the handler may
+	// return immediately.
+	s.fanoutObjectEvent(bucket, *obj, "OBJECT_FINALIZE")
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(obj)
 }
@@ -460,6 +745,9 @@ func (s *Service) handleMultipartUpload(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusInternalServerError, "internalError", err.Error())
 		return
 	}
+
+	// Fire-and-forget notification fan-out (Rule 3).
+	s.fanoutObjectEvent(bucket, *obj, "OBJECT_FINALIZE")
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(obj)
@@ -540,6 +828,9 @@ func (s *Service) handleResumableChunk(w http.ResponseWriter, r *http.Request, b
 	s.resumableMu.Lock()
 	delete(s.resumables, uploadID)
 	s.resumableMu.Unlock()
+
+	// Fire-and-forget OBJECT_FINALIZE notification fan-out (Rule 3).
+	s.fanoutObjectEvent(ru.Bucket, *obj, "OBJECT_FINALIZE")
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(obj)

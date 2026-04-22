@@ -10,6 +10,7 @@ import (
 
 	"github.com/slokam-ai/localgcp/internal/auth"
 	"github.com/slokam-ai/localgcp/internal/cloudrun"
+	"github.com/slokam-ai/localgcp/internal/cloudscheduler"
 	"github.com/slokam-ai/localgcp/internal/cloudtasks"
 	"github.com/slokam-ai/localgcp/internal/firestore"
 	"github.com/slokam-ai/localgcp/internal/gcs"
@@ -27,7 +28,7 @@ var version = "dev"
 func main() {
 	root := &cobra.Command{
 		Use:     "localgcp",
-		Short:   "The unified GCP emulator. One binary, thirteen services, zero cloud bills.",
+		Short:   "The unified GCP emulator. One binary, fifteen services, zero cloud bills.",
 		Version: version,
 	}
 
@@ -54,26 +55,80 @@ func upCmd() *cobra.Command {
 			}
 			_ = credPath
 
+			// Build loopback addresses for cross-service wiring.
+			//
+			// These addresses are threaded through setters on the GCS, Logging,
+			// and Cloud Scheduler services so that fire-and-forget publishers
+			// inside those services can dial their peer endpoints without any
+			// knowledge of the global config beyond the target host:port string.
+			// This is the Gate 12 (Config propagation tracing) trunk: changing
+			// --port-pubsub here automatically rewires all three loopback paths.
+			pubsubAddr := fmt.Sprintf("localhost:%d", cfg.PortPubSub)
+			gcsAddr := fmt.Sprintf("localhost:%d", cfg.PortGCS)
+
+			// Prepare the Docker runtime (shared between Cloud Run's lazy-start
+			// reverse proxy and the orchestrated Docker services).
+			//
+			// When --no-docker is set we skip runtime creation entirely; Cloud
+			// Run will return stub URIs (Rule 4) and orchestrated services are
+			// never registered. When --no-docker is not set we create the
+			// runtime and only wire it into Cloud Run if Docker is actually
+			// reachable — Cloud Run always succeeds at CreateService (allocates
+			// a port and returns http://localhost:{hostPort}), but the proxy
+			// returns 503 on first invoke if the runtime is nil.
+			var dockerRuntime orchestrator.ContainerRuntime
+			if !cfg.NoDocker {
+				r := orchestrator.NewDockerRuntime(log.New(os.Stderr, "[orchestrator] ", log.LstdFlags))
+				if r.Available() {
+					dockerRuntime = r
+					// Clean up orphaned containers from crashed sessions.
+					r.CleanupOrphans(cmd.Context(), "localgcp-")
+				} else {
+					fmt.Fprintln(os.Stderr, "Warning: Docker not available; Cloud Run invocations will return 503 and orchestrated services are skipped. Pass --no-docker for stub-URI Cloud Run behavior.")
+				}
+			}
+
 			srv := server.New(cfg)
-			srv.Register(gcs.New(cfg.DataDir, cfg.Quiet), cfg.PortGCS)
+
+			// Build native service instances with loopback wiring applied via
+			// additive setters (Rule 7a preserves the 2-arg New(...) signatures
+			// on gcs, logging, and cloudrun so existing unit tests continue to
+			// compile unchanged).
+			gcsSvc := gcs.New(cfg.DataDir, cfg.Quiet)
+			gcsSvc.SetPubsubEndpoint(pubsubAddr)
+
+			loggingSvc := logging.New(cfg.DataDir, cfg.Quiet)
+			loggingSvc.SetPubsubEndpoint(pubsubAddr)
+			loggingSvc.SetGcsEndpoint(gcsAddr)
+
+			cloudrunSvc := cloudrun.New(cfg.DataDir, cfg.Quiet)
+			cloudrunSvc.SetNoDocker(cfg.NoDocker)
+			if dockerRuntime != nil {
+				cloudrunSvc.SetRuntime(dockerRuntime)
+			}
+
+			// Cloud Scheduler's constructor takes pubsubAddr directly because
+			// its cron-tick dispatcher path requires the address on the very
+			// first tick; there is no safe window for a setter.
+			cloudschedulerSvc := cloudscheduler.New(cfg.DataDir, cfg.Quiet, pubsubAddr)
+
+			// Register all ten native services.
+			srv.Register(gcsSvc, cfg.PortGCS)
 			srv.Register(pubsub.New(cfg.DataDir, cfg.Quiet), cfg.PortPubSub)
 			srv.Register(secretmanager.New(cfg.DataDir, cfg.Quiet), cfg.PortSecretManager)
 			srv.Register(firestore.New(cfg.DataDir, cfg.Quiet), cfg.PortFirestore)
 			srv.Register(cloudtasks.New(cfg.DataDir, cfg.Quiet), cfg.PortCloudTasks)
 			srv.Register(vertexai.New(cfg.DataDir, cfg.Quiet, cfg.OllamaHost, cfg.VertexModelMap, cfg.VertexBackend, cfg.VertexAPIKey), cfg.PortVertexAI)
 			srv.Register(kms.New(cfg.DataDir, cfg.Quiet), cfg.PortKMS)
-			srv.Register(logging.New(cfg.DataDir, cfg.Quiet), cfg.PortLogging)
-			srv.Register(cloudrun.New(cfg.DataDir, cfg.Quiet), cfg.PortCloudRun)
+			srv.Register(loggingSvc, cfg.PortLogging)
+			srv.Register(cloudrunSvc, cfg.PortCloudRun)
+			srv.Register(cloudschedulerSvc, cfg.PortCloudScheduler)
 
 			// Register orchestrated Docker services (opt-in via --services).
 			if cfg.Services != "" && !cfg.NoDocker {
-				runtime := orchestrator.NewDockerRuntime(log.New(os.Stderr, "[orchestrator] ", log.LstdFlags))
-				if !runtime.Available() {
+				if dockerRuntime == nil {
 					fmt.Fprintln(os.Stderr, "Warning: Docker not available; skipping orchestrated services")
 				} else {
-					// Clean up orphaned containers from crashed sessions.
-					runtime.CleanupOrphans(cmd.Context(), "localgcp-")
-
 					requested := strings.Split(cfg.Services, ",")
 					portMap := map[string]int{
 						"spanner":     cfg.PortSpanner,
@@ -93,7 +148,7 @@ func upCmd() *cobra.Command {
 							return fmt.Errorf("no port configured for %s", svcName)
 						}
 						ecfg = orchestrator.WithDataDir(ecfg, cfg.DataDir)
-						srv.Register(orchestrator.NewLazyService(ecfg.Name, ecfg, runtime), port)
+						srv.Register(orchestrator.NewLazyService(ecfg.Name, ecfg, dockerRuntime), port)
 					}
 				}
 			}
@@ -112,6 +167,7 @@ func upCmd() *cobra.Command {
 	cmd.Flags().IntVar(&cfg.PortKMS, "port-kms", cfg.PortKMS, "Port for Cloud KMS")
 	cmd.Flags().IntVar(&cfg.PortLogging, "port-logging", cfg.PortLogging, "Port for Cloud Logging")
 	cmd.Flags().IntVar(&cfg.PortCloudRun, "port-cloudrun", cfg.PortCloudRun, "Port for Cloud Run")
+	cmd.Flags().IntVar(&cfg.PortCloudScheduler, "port-cloud-scheduler", cfg.PortCloudScheduler, "Port for Cloud Scheduler")
 	cmd.Flags().StringVar(&cfg.OllamaHost, "ollama-host", cfg.OllamaHost, "Ollama API host for Vertex AI backend")
 	cmd.Flags().StringVar(&cfg.VertexModelMap, "vertex-model-map", "", "Model alias mapping (e.g. gemini-2.5-flash=llama3.2)")
 	cmd.Flags().StringVar(&cfg.VertexBackend, "vertex-backend", "", "Vertex AI backend: ollama (default), openai, anthropic, stub")
@@ -129,7 +185,7 @@ func upCmd() *cobra.Command {
 }
 
 func envCmd() *cobra.Command {
-	var portGCS, portPubSub, portFirestore, portSecretManager, portCloudTasks, portVertexAI, portKMS, portLogging, portCloudRun, portBigQuery int
+	var portGCS, portPubSub, portFirestore, portSecretManager, portCloudTasks, portVertexAI, portKMS, portLogging, portCloudRun, portCloudScheduler, portBigQuery int
 
 	cmd := &cobra.Command{
 		Use:   "env",
@@ -138,6 +194,7 @@ func envCmd() *cobra.Command {
 			fmt.Printf("export STORAGE_EMULATOR_HOST=localhost:%d\n", portGCS)
 			fmt.Printf("export PUBSUB_EMULATOR_HOST=localhost:%d\n", portPubSub)
 			fmt.Printf("export FIRESTORE_EMULATOR_HOST=localhost:%d\n", portFirestore)
+			fmt.Printf("export CLOUD_SCHEDULER_EMULATOR_HOST=localhost:%d\n", portCloudScheduler)
 
 			// Check if existing GOOGLE_APPLICATION_CREDENTIALS is set.
 			if existing := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); existing != "" {
@@ -213,6 +270,7 @@ func envCmd() *cobra.Command {
 	cmd.Flags().IntVar(&portKMS, "port-kms", cfg.PortKMS, "Port for Cloud KMS")
 	cmd.Flags().IntVar(&portLogging, "port-logging", cfg.PortLogging, "Port for Cloud Logging")
 	cmd.Flags().IntVar(&portCloudRun, "port-cloudrun", cfg.PortCloudRun, "Port for Cloud Run")
+	cmd.Flags().IntVar(&portCloudScheduler, "port-cloud-scheduler", cfg.PortCloudScheduler, "Port for Cloud Scheduler")
 	cmd.Flags().IntVar(&portBigQuery, "port-bigquery", cfg.PortBigQuery, "Port for BigQuery (LocalBQ)")
 
 	return cmd
