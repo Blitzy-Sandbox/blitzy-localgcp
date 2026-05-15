@@ -1,0 +1,14 @@
+site_name: localgcp
+site_description: LocalStack for GCP — run Google Cloud locally via a single Go binary
+nav:
+  - Home: index.md
+  - Overview: overview.md
+  - Setup: setup.md
+plugins:
+  - techdocs-core
+markdown_extensions:
+  - admonition
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - toc:
+      permalink: true
