@@ -7,6 +7,8 @@ metadata:
     Cloud SQL, Memorystore, Cloud Tasks, KMS, Secret Manager, Cloud Run, Cloud Logging.
     Zero cloud bills.'
   tags:
+  - go
+  - infrastructure
   - new-feature
   annotations:
     github.com/project-slug: Blitzy-Sandbox/blitzy-localgcp
